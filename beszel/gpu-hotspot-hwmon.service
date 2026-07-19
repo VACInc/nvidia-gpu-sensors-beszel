@@ -1,0 +1,6 @@
+[Unit]
+Description=Publish NVIDIA Blackwell hotspot temps to synthetic hwmon for Beszel
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gpu-hotspot/update-hwmon.sh
