@@ -85,10 +85,21 @@ agent. Idempotent; survives reboots. Remove with `sudo ./uninstall.sh`.
 | RTX PRO 6000 Blackwell Workstation Edition | GB202 | yes | yes |
 | GeForce RTX 5090 | GB202 | yes | yes |
 | GeForce RTX 5060 Ti | GB206 | yes | yes |
-| GeForce RTX 3090 | GA102 | n/a (Blackwell-only registers) | n/a on this interface |
+| GeForce RTX 3090 | GA102 | yes | yes |
 
 Driver 610.43.02 on all of the above. Community reports of `n/a` hotspot on
 GB203/GB206 appear to be driver-version related (595.x); 610.x works here.
+
+Ampere uses a different layout and is handled separately: the on-die sensors
+live in the low NV_THERM window (`0x0203B8`–`0x0204C4`) rather than Blackwell's
+`0xAD0A90..`, and the memory-junction temperature comes from the GDDR6/6X
+controller register (`0xE2A8`, or `0xEE50` on GA104) instead of RUSD, which
+publishes no memory sensor on this generation. The Ampere offsets were
+confirmed on a GA102 RTX 3090 under a sustained 283 W load: core went 37 → 72 °C
+while the selected hotspot sensor tracked 47 → 87 °C and VRAM 44 → 70 °C. Two
+constant-valued words in the same window (`0x020074`, `0x020858`) are limits,
+not sensors, and are excluded. Ampere boards are matched by PCI device ID, so
+an unlisted card degrades to `n/a` instead of reading unknown registers.
 
 ## Safety notes
 

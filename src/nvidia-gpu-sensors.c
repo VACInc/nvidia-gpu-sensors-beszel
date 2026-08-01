@@ -99,6 +99,30 @@ static const unsigned NV_THERM_HOTSPOT[] = {
     0xAD0AD0, 0xAD0AD4, 0xAD0AD8, 0xAD0ADC, 0xAD0AE0, 0xAD0AE4,
 };
 
+/*
+ * Ampere (GA10x) puts its on-die sensors in the low NV_THERM window instead.
+ * Verified on GA102 (RTX 3090, 10de:2204, driver 610.43.02) by sweeping the
+ * 0x020000 window under a sustained 283 W load: these entries all tracked the
+ * load, and 0x02046C/0x020478 carried the maximum (core 37→72 C while this
+ * read 47→87 C, i.e. the familiar core+15 hot-spot delta). Two other tagged
+ * words in the same window are deliberately excluded because they never move:
+ * 0x020074 (constant 71.09 C) and 0x020858 (constant 196.22 C) are limits,
+ * not sensors, and would poison the maximum at idle.
+ */
+static const unsigned NV_THERM_HOTSPOT_AMPERE[] = {
+    0x0203B8, 0x0203BC, 0x02046C, 0x020470, 0x020478,
+    0x0204B8, 0x0204BC, 0x0204C0, 0x0204C4,
+};
+
+/*
+ * Ampere memory-junction temperature. Ampere does not publish a memory sensor
+ * through RUSD, but the GDDR6/6X controller exposes one in BAR0: bits 11:0 are
+ * the junction temperature in 1/32 C. Offsets follow the device-id table used
+ * by olealgoritme/gddr6; GA104 (3070) is the one outlier.
+ */
+#define AMPERE_VRAM_TEMP_DEFAULT 0x0000E2A8u
+#define AMPERE_VRAM_TEMP_GA104   0x0000EE50u
+
 #define NV_MAX_DEVICES        32
 #define NV_PROC_NAME_MAX_LENGTH 100
 #define NV_GPU_INVALID_ID     0xFFFFFFFFu
@@ -290,7 +314,11 @@ typedef struct {
     volatile uint8_t *rusd;
     NvU32 railMask;
     volatile uint8_t *bar0;   /* mapped BAR0 NV_THERM window, NULL if unavailable */
+    int arch;                 /* ARCH_* — selects the BAR0 sensor layout */
+    unsigned vramOff;         /* Ampere: BAR0 memory-junction register, 0 if none */
 } GPU;
+
+enum { ARCH_NONE = 0, ARCH_BLACKWELL, ARCH_AMPERE };
 
 static int is_blackwell(uint32_t boot0)
 {
@@ -298,9 +326,45 @@ static int is_blackwell(uint32_t boot0)
     return chip >= 0x1B0 && chip <= 0x1BF;   /* GB202/3/5/6/7 */
 }
 
-/* mmap just the NV_THERM window of a GPU's BAR0. Sets *denied on EACCES (non-root) */
-static volatile uint8_t *bar0_map(const char *bdf, int *denied, int *unsupported)
+/* Read the PCI device id of a GPU from sysfs. Returns 0 if unavailable. */
+static unsigned pci_device_id(const char *bdf)
 {
+    char path[256];
+    snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/device", bdf);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    unsigned id = 0;
+    if (fscanf(f, "%x", &id) != 1)
+        id = 0;
+    fclose(f);
+    return id;
+}
+
+/* GA10x boards with a known memory-junction register. Anything not listed keeps
+ * the pre-Ampere behaviour: no BAR0 reads beyond the chip-id probe. */
+static unsigned ampere_vram_offset(unsigned devid)
+{
+    switch (devid) {
+    case 0x2484: case 0x2488:                      /* GA104  RTX 3070 / LHR   */
+        return AMPERE_VRAM_TEMP_GA104;
+    case 0x2203: case 0x2204: case 0x2206:         /* GA102  3090 Ti/3090/3080 */
+    case 0x2208: case 0x2216:                      /* GA102  3080 Ti / 3080 LHR */
+    case 0x2231: case 0x2232: case 0x2236:         /* GA102  A5000/A4500/A10   */
+    case 0x24b0:                                   /* GA104  A4000             */
+    case 0x2531: case 0x2571:                      /* GA106  A2000             */
+        return AMPERE_VRAM_TEMP_DEFAULT;
+    default:
+        return 0;
+    }
+}
+
+/* mmap just the NV_THERM window of a GPU's BAR0. Sets *denied on EACCES (non-root) */
+static volatile uint8_t *bar0_map(const char *bdf, int *denied, int *unsupported,
+                                  int *arch, unsigned *vramOff)
+{
+    *arch = ARCH_NONE;
+    *vramOff = 0;
     char path[256];
     snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/resource0", bdf);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -314,13 +378,20 @@ static volatile uint8_t *bar0_map(const char *bdf, int *denied, int *unsupported
     if (p == MAP_FAILED)
         return NULL;
     /* Gate on chip id (NV_PMC_BOOT_0 @ +0x0 is a safe read on any GPU) so the
-     * Blackwell-only hotspot offsets are never read on another architecture. */
-    if (!is_blackwell(*(volatile uint32_t *)((volatile uint8_t *)p + NV_PMC_BOOT_0))) {
-        munmap(p, BAR0_MAP_LEN);
-        *unsupported = 1;
-        return NULL;
+     * per-architecture sensor offsets are never read on another architecture. */
+    if (is_blackwell(*(volatile uint32_t *)((volatile uint8_t *)p + NV_PMC_BOOT_0))) {
+        *arch = ARCH_BLACKWELL;
+        return (volatile uint8_t *)p;
     }
-    return (volatile uint8_t *)p;
+    unsigned off = ampere_vram_offset(pci_device_id(bdf));
+    if (off) {
+        *arch = ARCH_AMPERE;
+        *vramOff = off;
+        return (volatile uint8_t *)p;
+    }
+    munmap(p, BAR0_MAP_LEN);
+    *unsupported = 1;
+    return NULL;
 }
 
 /* Decode an NV_THERM temperature word: (w & 0xFFFF)/256, tagged 0x4000.
@@ -339,20 +410,44 @@ static int bar0_temp(volatile uint8_t *bar0, unsigned off, double *out)
     return 1;
 }
 
-/* Hot Spot = max over the 12 thermal sensors. Returns 1 if any read valid. */
-static int bar0_hotspot(volatile uint8_t *bar0, double *out)
+/* Hot Spot = max over the on-die thermal sensors. Returns 1 if any read valid. */
+static int bar0_hotspot(const GPU *g, double *out)
 {
-    if (!bar0)
+    if (!g->bar0)
         return 0;
+    const unsigned *offs;
+    size_t n;
+    if (g->arch == ARCH_AMPERE) {
+        offs = NV_THERM_HOTSPOT_AMPERE;
+        n = sizeof NV_THERM_HOTSPOT_AMPERE / sizeof NV_THERM_HOTSPOT_AMPERE[0];
+    } else {
+        offs = NV_THERM_HOTSPOT;
+        n = sizeof NV_THERM_HOTSPOT / sizeof NV_THERM_HOTSPOT[0];
+    }
     double mx = -1e9;
-    for (size_t i = 0; i < sizeof NV_THERM_HOTSPOT / sizeof NV_THERM_HOTSPOT[0]; i++) {
+    for (size_t i = 0; i < n; i++) {
         double t;
-        if (bar0_temp(bar0, NV_THERM_HOTSPOT[i], &t) && t > mx)
+        if (bar0_temp(g->bar0, offs[i], &t) && t > mx)
             mx = t;
     }
     if (mx < -1e8)
         return 0;
     *out = mx;
+    return 1;
+}
+
+/* Ampere memory-junction temperature from the GDDR6/6X controller: bits 11:0
+ * hold 1/32 C. Rejects readings outside a sane junction range so an unpowered
+ * or renumbered register never reaches Beszel as a real sensor. */
+static int bar0_vram_temp(const GPU *g, double *out)
+{
+    if (!g->bar0 || g->arch != ARCH_AMPERE || !g->vramOff)
+        return 0;
+    uint32_t w = *(volatile uint32_t *)(g->bar0 + g->vramOff);
+    double t = (double)(w & 0xFFF) / 32.0;
+    if (t < 5.0 || t > 125.0)
+        return 0;
+    *out = t;
     return 1;
 }
 
@@ -534,7 +629,10 @@ static void gpu_print(GPU *g)
     double tgpu = 0, tmem = 0, thot = 0;
     int have_gpu = g->rusd && read_temp(g->rusd, SENSOR_GPU, &tgpu);
     int have_mem = g->rusd && read_temp(g->rusd, SENSOR_MEMORY, &tmem);
-    int have_hot = bar0_hotspot(g->bar0, &thot);
+    int have_hot = bar0_hotspot(g, &thot);
+    /* Ampere publishes no memory sensor through RUSD; fall back to BAR0. */
+    if (!have_mem)
+        have_mem = bar0_vram_temp(g, &tmem);
 
     /* rail voltages */
     NvU32 v0 = 0, v1 = 0;
@@ -681,14 +779,15 @@ int main(int argc, char **argv)
         }
         snprintf(gpus[i].bdf, sizeof gpus[i].bdf, "%04x:%02x:%02x.0",
                  (unsigned)pci.domain, (unsigned)pci.bus, (unsigned)pci.slot);
-        gpus[i].bar0 = bar0_map(gpus[i].bdf, &bar0_denied, &bar0_unsupported);
+        gpus[i].bar0 = bar0_map(gpus[i].bdf, &bar0_denied, &bar0_unsupported,
+                                &gpus[i].arch, &gpus[i].vramOff);
         if (gpus[i].bar0)
             bar0_ok = 1;
     }
     if (!bar0_ok && bar0_denied)
         fprintf(stderr, "note: Hot Spot column needs root (BAR0 mmap) — showing n/a.\n");
     else if (!bar0_ok && bar0_unsupported)
-        fprintf(stderr, "note: Hot Spot column is Blackwell-only (GB20x) — showing n/a.\n");
+        fprintf(stderr, "note: Hot Spot needs Blackwell (GB20x) or a known Ampere board — showing n/a.\n");
 
     signal(SIGINT, on_sigint);
 
