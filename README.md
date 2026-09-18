@@ -120,3 +120,23 @@ src/       patched nvidia-gpu-sensors (MIT, upstream copyright preserved)
 beszel/    update-hwmon.sh, systemd units, beszel-agent drop-in
 install.sh / uninstall.sh
 ```
+
+### RTX 3050 6GB (GA107)
+
+PCI `10de:2584`, chipset `0x177`, supports a narrowly gated read of the
+Ampere hotspot register `0x02046C`. Chipset extraction masks `0x1ff00000`
+(as Linux nouveau does); the observed BOOT0 is `0xb77000a1`.
+The tagged Q8.8 word `0x40002c30` decoded to 44.1875 C with core at 34.2 C.
+Other GA107 boards are not implicitly enabled.
+
+VRAM temperature remains unavailable on the tested board: RUSD returns no
+reading and no GA107 memory-register mapping has been validated. No guessed
+VRAM register or fabricated sensor is published. Existing supported boards
+are unchanged.
+
+Regression test: `gcc -std=gnu11 -Wall -Wextra -O2 tests/ga107.c -o /tmp/ga107-test && /tmp/ga107-test`.
+
+Hardware validation on 2026-09-18 (driver 610.57.04): a bounded 45-second
+CUDA load moved core from 34.2 C to 70.4 C and hotspot from 44.2 C to 82.9 C,
+at approximately 69.8 W and 100% utilization. CSV memory remained empty.
+The hotspot tracks load; this does not establish a VRAM register.

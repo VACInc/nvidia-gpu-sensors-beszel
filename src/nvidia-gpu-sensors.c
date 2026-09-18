@@ -115,6 +115,16 @@ static const unsigned NV_THERM_HOTSPOT_AMPERE[] = {
 };
 
 /*
+ * GA107 has public read-only precedent for the common Ampere hot-spot register
+ * at 0x02046C, but the wider GA102 sensor-bank sweep above has not yet been
+ * validated on this die. Read only the established register until hardware
+ * sampling proves more offsets on 10de:2584.
+ */
+static const unsigned NV_THERM_HOTSPOT_GA107[] = {
+    0x02046C,
+};
+
+/*
  * Ampere memory-junction temperature. Ampere does not publish a memory sensor
  * through RUSD, but the GDDR6/6X controller exposes one in BAR0: bits 11:0 are
  * the junction temperature in 1/32 C. Offsets follow the device-id table used
@@ -318,12 +328,17 @@ typedef struct {
     unsigned vramOff;         /* Ampere: BAR0 memory-junction register, 0 if none */
 } GPU;
 
-enum { ARCH_NONE = 0, ARCH_BLACKWELL, ARCH_AMPERE };
+enum { ARCH_NONE = 0, ARCH_BLACKWELL, ARCH_AMPERE, ARCH_AMPERE_GA107 };
 
 static int is_blackwell(uint32_t boot0)
 {
     unsigned chip = boot0 >> 20;
     return chip >= 0x1B0 && chip <= 0x1BF;   /* GB202/3/5/6/7 */
+}
+
+static int is_ga107(uint32_t boot0)
+{
+    return ((boot0 & 0x1ff00000u) >> 20) == 0x177;
 }
 
 /* Read the PCI device id of a GPU from sysfs. Returns 0 if unavailable. */
@@ -379,11 +394,17 @@ static volatile uint8_t *bar0_map(const char *bdf, int *denied, int *unsupported
         return NULL;
     /* Gate on chip id (NV_PMC_BOOT_0 @ +0x0 is a safe read on any GPU) so the
      * per-architecture sensor offsets are never read on another architecture. */
-    if (is_blackwell(*(volatile uint32_t *)((volatile uint8_t *)p + NV_PMC_BOOT_0))) {
+    uint32_t boot0 = *(volatile uint32_t *)((volatile uint8_t *)p + NV_PMC_BOOT_0);
+    if (is_blackwell(boot0)) {
         *arch = ARCH_BLACKWELL;
         return (volatile uint8_t *)p;
     }
-    unsigned off = ampere_vram_offset(pci_device_id(bdf));
+    unsigned devid = pci_device_id(bdf);
+    if (devid == 0x2584 && is_ga107(boot0)) {
+        *arch = ARCH_AMPERE_GA107;
+        return (volatile uint8_t *)p;
+    }
+    unsigned off = ampere_vram_offset(devid);
     if (off) {
         *arch = ARCH_AMPERE;
         *vramOff = off;
@@ -417,7 +438,10 @@ static int bar0_hotspot(const GPU *g, double *out)
         return 0;
     const unsigned *offs;
     size_t n;
-    if (g->arch == ARCH_AMPERE) {
+    if (g->arch == ARCH_AMPERE_GA107) {
+        offs = NV_THERM_HOTSPOT_GA107;
+        n = sizeof NV_THERM_HOTSPOT_GA107 / sizeof NV_THERM_HOTSPOT_GA107[0];
+    } else if (g->arch == ARCH_AMPERE) {
         offs = NV_THERM_HOTSPOT_AMPERE;
         n = sizeof NV_THERM_HOTSPOT_AMPERE / sizeof NV_THERM_HOTSPOT_AMPERE[0];
     } else {
