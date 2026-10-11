@@ -12,7 +12,7 @@
 #   * every 5 min: PCIe replays (nvidia-smi -q), PCIe AER totals (sysfs) and
 #     NVLink replay/recovery/CRC errors (nvidia-smi nvlink -e). Any rise sends
 #     an alert, one per card per counter family per hour.
-# Jetson mode (/etc/nv_tegra_release, no nvidia-smi):
+# Jetson mode (/etc/nv_tegra_release, even if nvidia-smi exists):
 #   * one log line per run: hottest thermal zone, margin to the 99 C soctherm
 #     throttle trip, active throttle alerts, over-current event counters.
 #   * alert when throttle alerts are active > 30 s in 5 min, or an OC event
@@ -123,6 +123,7 @@ nvidia_cycle() {
     while IFS=, read -r idx name bus temp tl pwr pcap swt hwt brk; do
         idx=${idx// /} name=${name# } name=${name#NVIDIA }
         bus=${bus// /} bus=${bus,,} bdf=${bus: -12}
+        [[ "$bdf" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] || continue
         temp=${temp// /} tl=${tl// /} pwr=${pwr// /}
         pcap=${pcap// /} swt=${swt// /} hwt=${hwt// /} brk=${brk// /}
         [[ "$pcap" =~ ^[0-9]+$ ]] || pcap=0
@@ -272,10 +273,17 @@ Log: $LOG"
 Log: $LOG"
 }
 
+# Tegra first: JetPack 7 ships an nvidia-smi for the integrated GPU, but it
+# has no PCI bus, temperature or link counters.
 MODE="${GPU_HEALTH_MODE:-auto}"
-if [[ "$MODE" == nvidia ]] || { [[ "$MODE" == auto ]] && command -v nvidia-smi >/dev/null 2>&1; }; then
+if [[ "$MODE" == auto ]]; then
+    if [[ -r /etc/nv_tegra_release ]]; then MODE=jetson
+    elif command -v nvidia-smi >/dev/null 2>&1; then MODE=nvidia
+    fi
+fi
+if [[ "$MODE" == nvidia ]]; then
     nvidia_cycle
-elif [[ "$MODE" == jetson ]] || [[ -r /etc/nv_tegra_release ]]; then
+elif [[ "$MODE" == jetson ]]; then
     jetson_cycle
 else
     log "no supported GPU found"

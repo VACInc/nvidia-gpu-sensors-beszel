@@ -12,7 +12,8 @@ echo 0 >"$T/swt"; echo 0 >"$T/replay"; echo 0 >"$T/nvcrc"; echo 0 >"$T/aercor"
 cat >"$T/bin/nvidia-smi" <<EOF
 #!/bin/sh
 case "\$1" in
-  --query-gpu=*) echo "3, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 00000000:41:00.0, 45, 57, 80.5, 100, \$(cat $T/swt), 0, 0" ;;
+  --query-gpu=*) echo "3, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 00000000:41:00.0, 45, 57, 80.5, 100, \$(cat $T/swt), 0, 0"
+                 echo "0, Orin (nvgpu), [N/A], [N/A], [N/A], [N/A], 0, 0, 0, 0" ;;
   -q) printf 'GPU 00000000:41:00.0\n    PCI\n        Replays Since Reset    : %s\n        Replay Number Rollovers : 0\n' "\$(cat $T/replay)" ;;
   nvlink) printf 'GPU 3: NVIDIA RTX PRO 6000 (UUID: x)\n\t Link 0: Replay Errors: 0\n\t Link 0: Recovery Errors: 0\n\t Link 0: CRC Errors: %s\n' "\$(cat $T/nvcrc)" ;;
 esac
@@ -43,6 +44,7 @@ run
 grep -q 'gpu=3 bdf=0000:41:00.0 .*hot=52.3 hot_sensor=0xAD0A94 vram_chip=D1B vram_chip_c=64 chips=32 tlimit=57' "$T"/log/* || fail "card line"
 grep -q 'errors gpu=3 .*pcie_replay=0 .*aer_cor=0 .*nvlink_crc=0' "$T"/log/* || fail "errors line"
 [ ! -e "$T/curl.log" ] || fail "alert on first run"
+grep -q 'Orin\|bad array' "$T"/log/* && fail "busless row not skipped"
 
 # 20 s of thermal slowdown: below the 30 s limit.
 echo 20000000 >"$T/swt"; run

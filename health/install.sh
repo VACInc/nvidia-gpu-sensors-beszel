@@ -8,13 +8,16 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 
 mkdir -p /opt/gpu-health/bin
-if command -v nvidia-smi >/dev/null 2>&1; then
+if [ -r /etc/nv_tegra_release ]; then
+    # Jetson: thermal zones only. Its nvidia-smi has no PCI GPU for the helper.
+    rm -f /opt/gpu-health/bin/nvidia-gpu-sensors
+elif command -v nvidia-smi >/dev/null 2>&1; then
     command -v gcc >/dev/null || { echo "gcc not found" >&2; exit 1; }
     gcc -std=gnu11 -O2 -Wall -Wextra -o /opt/gpu-health/bin/nvidia-gpu-sensors.new \
         "$HERE/src/nvidia-gpu-sensors.c"
     /opt/gpu-health/bin/nvidia-gpu-sensors.new --detail >/dev/null
     mv -f /opt/gpu-health/bin/nvidia-gpu-sensors.new /opt/gpu-health/bin/nvidia-gpu-sensors
-elif [ ! -r /etc/nv_tegra_release ]; then
+else
     echo "no nvidia-smi and not a Jetson: nothing to watch" >&2
     exit 1
 fi
