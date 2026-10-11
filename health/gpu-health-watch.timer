@@ -1,0 +1,10 @@
+[Unit]
+Description=Run gpu-health-watch every 30s
+
+[Timer]
+OnBootSec=40s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

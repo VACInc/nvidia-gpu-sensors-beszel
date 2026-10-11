@@ -45,6 +45,10 @@ Vendored from upstream @ `505a11e` (MIT, license preserved), with these fixes:
    status code instead of silently dropping the GPU.
 4. **`--csv` mode.** BDF-keyed machine-readable output for scripting:
    `0000:41:00.0,37.1,38.0,39.8,0.805,`
+5. **`--detail` mode.** The `--csv` columns plus which die sensor is the
+   hottest and which GDDR chip is the hottest:
+   `0000:41:00.0,45.0,60.0,52.3,0.9,0.9,0xAD0A94,52.3,D1B,64,32`
+   (hot spot register, its value, hottest chip label, its value, chip count).
 
 ## How the Beszel side works
 
@@ -64,6 +68,10 @@ appended only when several GPUs share a name.
 
 A one-line drop-in points `beszel-agent` at the shadow tree. Nothing else
 about the agent changes, and removing the drop-in reverts everything.
+
+Boards that report NVIDIA's T.Limit (`temperature.gpu.tlimit`, the margin in
+degrees C to the slowdown temperature; Blackwell here) also get a
+`<GPU> T.Limit` sensor. Lower is hotter; throttling starts near 0.
 
 ## Install
 
@@ -113,11 +121,39 @@ an unlisted card degrades to `n/a` instead of reading unknown registers.
 - Not affiliated with NVIDIA. The interfaces are unofficial and may change in
   future drivers.
 
+## Per-chip VRAM and the health watch
+
+`--detail` reads every GDDR chip's own sensor (register layout from LACT
+PR #1125): partition `p` keeps four 32-bit slots at `0x9024C0 + p*0x4000` and
+a valid mask in bits 24..27 of `0x9024D0 + p*0x4000`. Byte 2 is the front
+chip, byte 3 the back chip on clamshell boards (`0x900200` bit 22), and
+C = 2 * min(raw, 0x50) - 40. Labels name the chip: `D1B` is partition D,
+chip 1, back side. Validated read-only on GA102 (3090, 24 chips), GA106
+(A2000, 6 chips) and GB202 (RTX PRO 6000, 32 chips); GA107 reports none.
+The single VRAM value Beszel charts is unchanged.
+
+`health/` installs `gpu-health-watch` (`sudo health/install.sh`), a 30 s
+timer that is separate from the Beszel publisher:
+
+- logs one line per card to `/var/log/gpu-health/gpu-YYYY-MM-DD.log` (30 days):
+  core, hot spot and its sensor register, hottest VRAM chip, T.Limit, power,
+  and slowdown seconds per reason since the previous sample;
+- sends ntfy (`/etc/ntfy.env`, `NTFY_URL` + `NTFY_AUTH=user:password`) when
+  thermal or power-brake slowdown exceeds 30 s in 5 min (power cap is logged
+  only), or when PCIe replays, PCIe AER totals or NVLink replay/recovery/CRC
+  errors rise (polled every 5 min). One alert per card and kind per hour;
+- on Jetson (no NVML), logs the hottest thermal zone, margin to the 99 C
+  throttle trip, active throttle alerts and soctherm over-current counters,
+  and alerts on > 30 s of throttling in 5 min or any new over-current event.
+
+Tests: `tests/health-watch.sh` (fake nvidia-smi/sysfs) and `tests/detail.c`.
+
 ## Layout
 
 ```
 src/       patched nvidia-gpu-sensors (MIT, upstream copyright preserved)
 beszel/    update-hwmon.sh, systemd units, beszel-agent drop-in
+health/    gpu-health-watch (thermal log + slowdown/link-error ntfy)
 install.sh / uninstall.sh
 ```
 

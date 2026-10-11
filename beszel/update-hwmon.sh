@@ -15,9 +15,15 @@
 # appended only when several GPUs share a name), e.g.
 # "RTX PRO 6000 Blackwell Workstation Edition 3 Hotspot".
 #
-# Synthetic dirs are hwmon<900 + 2*gpu_index (+1 for VRAM)> — keyed to the
-# nvidia-smi index so names stay stable across boots, far above any real
-# hwmon index, and matched by gopsutil's hwmon* glob.
+# Synthetic dirs are hwmon<900 + 2*gpu_index (+1 for VRAM)> and
+# hwmon<980 + gpu_index> for T.Limit — keyed to the nvidia-smi index so names
+# stay stable across boots, far above any real hwmon index, and matched by
+# gopsutil's hwmon* glob.
+#
+# T.Limit is NVIDIA's margin to the GPU's slowdown temperature in degrees C
+# (nvidia-smi temperature.gpu.tlimit): it falls as the card heats and
+# throttling starts near 0. Only boards that report it (Blackwell so far) get
+# the sensor; [N/A] is skipped.
 set -euo pipefail
 
 ROOT=/run/gpu-sensors-sys
@@ -32,15 +38,17 @@ for d in /sys/class/hwmon/hwmon*; do
     ln -sfn "$(readlink -f "$d")" "$HW/$(basename "$d")"
 done
 
-declare -A GPU_NAME GPU_INDEX NAME_COUNT
-while IFS=, read -r idx name bus; do
+declare -A GPU_NAME GPU_INDEX GPU_TLIMIT NAME_COUNT
+while IFS=, read -r idx name bus tlimit; do
     idx="${idx// /}"
     name="${name# }"; name="${name#NVIDIA }"
     bus="${bus// /}"; bus="${bus,,}"; bdf="${bus: -12}"
+    tlimit="${tlimit// /}"
     GPU_NAME[$bdf]="$name"
     GPU_INDEX[$bdf]="$idx"
+    [[ "$tlimit" =~ ^-?[0-9]+$ ]] && GPU_TLIMIT[$bdf]="$tlimit"
     NAME_COUNT[$name]=$(( ${NAME_COUNT[$name]:-0} + 1 ))
-done < <(nvidia-smi --query-gpu=index,name,pci.bus_id --format=csv,noheader)
+done < <(nvidia-smi --query-gpu=index,name,pci.bus_id,temperature.gpu.tlimit --format=csv,noheader,nounits)
 
 declare -A written
 write_sensor() {  # write_sensor <dirnum> <display-name> <degC>
@@ -60,6 +68,7 @@ while IFS=, read -r bdf core mem hot v0 v1; do
     [ "${NAME_COUNT[$name]}" -gt 1 ] && disp="$name $idx"
     [ -n "$hot" ] && write_sensor $(( 900 + 2*idx ))     "$disp Hotspot" "$hot"
     [ -n "$mem" ] && write_sensor $(( 900 + 2*idx + 1 )) "$disp VRAM"    "$mem"
+    [ -n "${GPU_TLIMIT[$bdf]:-}" ] && write_sensor $(( 980 + idx )) "$disp T.Limit" "${GPU_TLIMIT[$bdf]}"
 done < <("$BIN" --csv)
 
 # Remove synthetic dirs (non-symlinks) that weren't written this run, so

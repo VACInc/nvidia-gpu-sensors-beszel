@@ -475,9 +475,108 @@ static int bar0_vram_temp(const GPU *g, double *out)
     return 1;
 }
 
+/* Hottest on-die sensor and its register, for --detail. Same sensor set as
+ * bar0_hotspot(), so the returned temperature always equals the Hot Spot. */
+static int bar0_hotspot_sensor(const GPU *g, double *out, unsigned *reg)
+{
+    if (!g->bar0)
+        return 0;
+    const unsigned *offs;
+    size_t n;
+    if (g->arch == ARCH_AMPERE_GA107) {
+        offs = NV_THERM_HOTSPOT_GA107;
+        n = sizeof NV_THERM_HOTSPOT_GA107 / sizeof NV_THERM_HOTSPOT_GA107[0];
+    } else if (g->arch == ARCH_AMPERE) {
+        offs = NV_THERM_HOTSPOT_AMPERE;
+        n = sizeof NV_THERM_HOTSPOT_AMPERE / sizeof NV_THERM_HOTSPOT_AMPERE[0];
+    } else {
+        offs = NV_THERM_HOTSPOT;
+        n = sizeof NV_THERM_HOTSPOT / sizeof NV_THERM_HOTSPOT[0];
+    }
+    double mx = -1e9;
+    unsigned at = 0;
+    for (size_t i = 0; i < n; i++) {
+        double t;
+        if (bar0_temp(g->bar0, offs[i], &t) && t > mx) {
+            mx = t;
+            at = offs[i];
+        }
+    }
+    if (mx < -1e8)
+        return 0;
+    *out = mx;
+    *reg = at;
+    return 1;
+}
+
+/*
+ * Per-chip GDDR6/6X temperatures (LACT PR #1125). Each memory partition p has a
+ * data block at 0x9024C0 + p*0x4000 (four 32-bit slots) and a status word at
+ * 0x9024D0 + p*0x4000 whose bits 24..27 mark slots +0/+4/+8/+0xC valid. Slots
+ * pair up per chip position: {+0,+8} and {+4,+0xC}; the first valid slot of a
+ * pair is used. Byte 2 is the front chip, byte 3 the back chip (clamshell
+ * boards only, flagged by bit 22 of 0x900200). C = 2*min(raw,0x50) - 40.
+ * Validated read-only on GA102 (3090, 24 chips), GA106 (A2000, 6 chips) and
+ * GB202 (RTX PRO 6000, 32 chips). GA107 reports no valid slot, so it is skipped.
+ * Labels: partition letter + position + F/B, e.g. "D1B" = partition D, chip 1,
+ * back side.
+ */
+#define GDDR_TEMP_DATA_BASE   0x009024C0u
+#define GDDR_TEMP_STATUS_BASE 0x009024D0u
+#define GDDR_CLAMSHELL        0x00900200u
+#define GDDR_PARTITIONS       9
+
+static int gddr_raw_ok(unsigned raw)
+{
+    return raw != 0 && raw != 0xFF;
+}
+
+static int bar0_vram_chips(const GPU *g, double *hot, char label[8], int *count)
+{
+    *count = 0;
+    if (!g->bar0 || (g->arch != ARCH_AMPERE && g->arch != ARCH_BLACKWELL))
+        return 0;
+    static const unsigned slot[2][2] = { { 0x0, 0x8 }, { 0x4, 0xC } };
+    static const unsigned bit[2][2] = { { 24, 26 }, { 25, 27 } };
+    int clam = (*(volatile uint32_t *)(g->bar0 + GDDR_CLAMSHELL) >> 22) & 1;
+    int best = -1000;
+    for (unsigned p = 0; p < GDDR_PARTITIONS; p++) {
+        uint32_t status = *(volatile uint32_t *)(g->bar0 + GDDR_TEMP_STATUS_BASE + p * 0x4000u);
+        if ((status & 0xFFFF0000u) == 0xBADF0000u)
+            continue;
+        for (unsigned k = 0; k < 2; k++) {
+            for (unsigned s = 0; s < 2; s++) {
+                if (!(status & (1u << bit[k][s])))
+                    continue;
+                uint32_t d = *(volatile uint32_t *)(g->bar0 + GDDR_TEMP_DATA_BASE + p * 0x4000u + slot[k][s]);
+                if (d == 0 || d == 0xFFFFFFFFu || (d & 0xFFFF0000u) == 0xBADF0000u)
+                    continue;
+                unsigned raw[2] = { (d >> 16) & 0xFF, (d >> 24) & 0xFF };
+                for (int side = 0; side < (clam ? 2 : 1); side++) {
+                    if (!gddr_raw_ok(raw[side]))
+                        continue;
+                    unsigned r = raw[side] < 0x50 ? raw[side] : 0x50;
+                    int c = 2 * (int)r - 40;
+                    (*count)++;
+                    if (c > best) {
+                        best = c;
+                        snprintf(label, 8, "%c%u%s", 'A' + p, k, side ? "B" : "F");
+                    }
+                }
+                break;
+            }
+        }
+    }
+    if (!*count)
+        return 0;
+    *hot = best;
+    return 1;
+}
+
 /* colour helpers (temperature bands) */
 static int g_color = 1;
 static int g_csv = 0;
+static int g_detail = 0;
 static const char *temp_color(double c)
 {
     if (!g_color)
@@ -693,6 +792,23 @@ static void gpu_print(GPU *g)
         printf(",");
         if (have_v1)
             printf("%.3f", v1 / 1e6);
+        if (g_detail) {
+            /* ,hot_reg,hot_reg_c,vram_chip,vram_chip_c,vram_chips */
+            double hc = 0, vc = 0;
+            unsigned reg = 0;
+            char lab[8] = "";
+            int nchips = 0;
+            printf(",");
+            if (bar0_hotspot_sensor(g, &hc, &reg))
+                printf("0x%06X,%.1f", reg, hc);
+            else
+                printf(",");
+            printf(",");
+            if (bar0_vram_chips(g, &vc, lab, &nchips))
+                printf("%s,%.0f,%d", lab, vc, nchips);
+            else
+                printf(",,0");
+        }
         printf("\n");
         return;
     }
@@ -721,13 +837,20 @@ int main(int argc, char **argv)
             g_csv = 1;
             g_color = 0;
         }
+        else if (!strcmp(argv[i], "--detail")) {
+            g_csv = 1;
+            g_detail = 1;
+            g_color = 0;
+        }
         else if (!strcmp(argv[i], "--no-color"))
             g_color = 0;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            printf("usage: %s [--watch|-w] [--no-color] [--csv]\n", argv[0]);
+            printf("usage: %s [--watch|-w] [--no-color] [--csv|--detail]\n", argv[0]);
             printf("  shows GPU/memory/hot-spot temperature and both rail voltages per GPU.\n");
             printf("  Hot Spot is read from BAR0 NV_THERM and needs root; degrades to n/a otherwise.\n");
             printf("  --csv emits bdf,core,mem,hotspot,nvvdd,msvdd with no header.\n");
+            printf("  --detail emits the --csv columns plus hot_reg,hot_reg_c,vram_chip,vram_chip_c,vram_chips\n");
+            printf("    (hottest die sensor register and hottest GDDR chip, e.g. D1B = partition D chip 1 back).\n");
             return 0;
         }
     }

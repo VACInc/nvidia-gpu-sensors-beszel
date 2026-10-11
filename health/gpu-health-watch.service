@@ -1,0 +1,15 @@
+[Unit]
+Description=Log GPU hot spot / hottest VRAM chip and alert on GPU slowdowns and link errors
+
+[Service]
+Type=oneshot
+TimeoutStartSec=90
+ExecStart=/opt/gpu-health/gpu-health-watch.sh
+Nice=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+LogsDirectory=gpu-health
+StateDirectory=gpu-health-watch
+StateDirectoryMode=0700
