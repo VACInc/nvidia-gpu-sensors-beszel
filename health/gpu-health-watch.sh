@@ -9,6 +9,9 @@
 #     accrued since the previous run.
 #   * slowdown alert: sw thermal + hw thermal + hw power brake time > 30 s in
 #     any 5 min window. Power cap is logged only. One alert per card per hour.
+#     SW thermal time counts only while the core is at or above SW_THERM_MIN_C:
+#     GA102 cards held in P8 by an idle CUDA context tick the sw thermal
+#     counter alongside SW power cap at 35 C (vacdotai E1, 2026-10-11).
 #   * every 5 min: PCIe replays (nvidia-smi -q), PCIe AER totals (sysfs) and
 #     NVLink replay/recovery/CRC errors (nvidia-smi nvlink -e). Any rise sends
 #     an alert, one per card per counter family per hour.
@@ -38,6 +41,7 @@ THERMAL_SYSFS="${GPU_HEALTH_THERMAL_SYSFS:-/sys/class/thermal}"
 HWMON_SYSFS="${GPU_HEALTH_HWMON_SYSFS:-/sys/class/hwmon}"
 WINDOW=300            # slowdown window, seconds
 SLOW_LIMIT_US=30000000
+SW_THERM_MIN_C=${GPU_HEALTH_SW_THERM_MIN_C:-70}
 REALERT=3600
 ERR_EVERY=300         # link error poll interval, seconds
 KEEP_DAYS=30
@@ -144,15 +148,19 @@ nvidia_cycle() {
         dh=$(( hwt - ${LASTCNT[$k.hwt]:-$hwt} )); (( dh < 0 )) && dh=0
         db=$(( brk - ${LASTCNT[$k.brk]:-$brk} )); (( db < 0 )) && db=0
         LASTCNT[$k.pcap]=$pcap LASTCNT[$k.swt]=$swt LASTCNT[$k.hwt]=$hwt LASTCNT[$k.brk]=$brk
+        # Alertable sw thermal time accrues only while the card is warm.
+        local swhot=$ds
+        [[ "$temp" =~ ^[0-9]+$ ]] && (( temp < SW_THERM_MIN_C )) && swhot=0
+        LASTCNT[$k.swhot]=$(( ${LASTCNT[$k.swhot]:-0} + swhot ))
         log "gpu=$idx bdf=$bdf name=\"$name\" core=${temp:-na} hot=${hot:-na} hot_sensor=${hreg:-na}" \
             "vram_chip=${chip:-na} vram_chip_c=${chipc:-na} chips=${nchips:-0} tlimit=${tl:-na} power_w=${pwr:-na}" \
             "slow_s pwrcap=$(us_to_s $dp) sw_therm=$(us_to_s $ds) hw_therm=$(us_to_s $dh) pwr_brake=$(us_to_s $db)"
-        window_delta "$k.slow" $(( swt + hwt + brk ))
+        window_delta "$k.slow" $(( ${LASTCNT[$k.swhot]} + hwt + brk ))
         local w=$WDELTA
         if (( w > SLOW_LIMIT_US )); then
             alert "$k.slow" 4 "GPU slowdown: $HOST GPU$idx $name" \
 "Thermal/brake clock slowdown $(us_to_s "$w") s in the last 5 min.
-Since last sample: sw_thermal $(us_to_s $ds) s, hw_thermal $(us_to_s $dh) s, power_brake $(us_to_s $db) s.
+Since last sample: sw_thermal $(us_to_s $swhot) s, hw_thermal $(us_to_s $dh) s, power_brake $(us_to_s $db) s.
 Core ${temp:-na} C, Hot Spot ${hot:-na} C (${hreg:-na}), hottest VRAM chip ${chip:-na} ${chipc:-na} C, T.Limit ${tl:-na}.
 Log: $LOG"
         fi
