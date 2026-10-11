@@ -3,6 +3,9 @@ Description=Refresh Blackwell hotspot temps for Beszel every 30s
 
 [Timer]
 OnBootSec=30
+# OnBootSec is lost if a slow boot starts timers.target after that mark, and
+# OnUnitActiveSec never arms until the service has run once this boot.
+OnActiveSec=15s
 OnUnitActiveSec=30
 AccuracySec=5
 
