@@ -1,0 +1,34 @@
+GPU 3: Fixture GPU
+    Link 0:
+        Malformed packet Errors: @COUNT@
+        Buffer overrun Errors: @COUNT@
+        Rx Errors: @COUNT@
+        Rx remote Errors: @COUNT@
+        Rx General Errors: @COUNT@
+        Local link integrity Errors: @COUNT@
+        Tx discards: @COUNT@
+        Link recovery successful events: @COUNT@
+        Link recovery failed events: @COUNT@
+        Effective Errors: @COUNT@
+        FEC Errors - 0: @COUNT@
+        FEC Errors - 1: @COUNT@
+        FEC Errors - 2: @COUNT@
+        FEC Errors - 3: @COUNT@
+        FEC Errors - 4: @COUNT@
+        FEC Errors - 5: @COUNT@
+        FEC Errors - 6: @COUNT@
+        FEC Errors - 7: @COUNT@
+        FEC Errors - 8: @COUNT@
+        FEC Errors - 9: @COUNT@
+        FEC Errors - 10: @COUNT@
+        FEC Errors - 11: @COUNT@
+        FEC Errors - 12: @COUNT@
+        FEC Errors - 13: @COUNT@
+        FEC Errors - 14: @COUNT@
+        FEC Errors - 15: @COUNT@
+        Tx packets: @TRAFFIC@
+        Tx bytes: @TRAFFIC@
+        Rx packets: @TRAFFIC@
+        Rx bytes: @TRAFFIC@
+        Effective BER: 1.2e-10
+        Symbol BER: 0.00001

@@ -43,6 +43,7 @@ WINDOW=300            # slowdown window, seconds
 SLOW_LIMIT_US=30000000
 SW_THERM_MIN_C=${GPU_HEALTH_SW_THERM_MIN_C:-70}
 REALERT=3600
+RETRY_EVERY=60        # at most one delivery attempt per key per minute
 ERR_EVERY=300         # link error poll interval, seconds
 KEEP_DAYS=30
 JETSON_TRIP_MC=99000  # soctherm software throttle trip on Orin
@@ -57,6 +58,7 @@ HOST="${HOSTNAME%%.*}"
 
 # Persistent state (declare -p dump of these arrays and scalars).
 declare -A RING=() LAST_ALERT=() ERRBASE=() LASTCNT=()
+declare -A PENDING_TITLE=() PENDING_BODY=() PENDING_PRIO=() LAST_ATTEMPT=()
 WDELTA=0 RISE=0
 LAST_ERRPOLL=0 LAST_PRUNE=0
 # shellcheck disable=SC1090
@@ -77,14 +79,28 @@ alert() {
         log "alert-suppressed key=$key title=\"$title\""
         return 0
     fi
-    LAST_ALERT[$key]=$NOW
     log "alert key=$key title=\"$title\" body=\"${body//$'\n'/ | }\""
-    [[ -n "$NTFY_URL" ]] || { log "alert-not-sent reason=no-ntfy-env key=$key"; return 0; }
-    # NTFY_AUTH is user:password; a --config pipe keeps it off curl's argv.
-    curl -fsS -m 15 -o /dev/null --config <(printf 'user = "%s"\n' "$NTFY_AUTH") \
-        -H "Title: $title" -H "Priority: $prio" -H "Tags: no-repair,thermometer" \
-        --data-binary "$body" "$NTFY_URL" 2>>"$LOG" ||
-        log "alert-send-failed key=$key"
+    PENDING_TITLE[$key]=$title PENDING_BODY[$key]=$body PENDING_PRIO[$key]=$prio
+}
+
+# Persist failed one-shot counter alerts too. Retry once per key per minute,
+# even if the counter stops rising; successful sends alone start the cooldown.
+deliver_pending() {
+    local key
+    for key in "${!PENDING_TITLE[@]}"; do
+        (( NOW - ${LAST_ATTEMPT[$key]:-0} >= RETRY_EVERY )) || continue
+        LAST_ATTEMPT[$key]=$NOW
+        [[ -n "$NTFY_URL" ]] || { log "alert-not-sent reason=no-ntfy-env key=$key"; continue; }
+        # NTFY_AUTH stays off curl's argv. Never log curl's potentially sensitive diagnostics.
+        if curl -fsS -m 15 -o /dev/null --config <(printf 'user = "%s"\n' "$NTFY_AUTH") \
+            -H "Title: ${PENDING_TITLE[$key]}" -H "Priority: ${PENDING_PRIO[$key]}" \
+            -H "Tags: no-repair,thermometer" --data-binary "${PENDING_BODY[$key]}" "$NTFY_URL" 2>/dev/null; then
+            LAST_ALERT[$key]=$NOW
+            unset 'PENDING_TITLE[$key]' 'PENDING_BODY[$key]' 'PENDING_PRIO[$key]'
+        else
+            log "alert-send-failed key=$key"
+        fi
+    done
 }
 
 # window_delta <key> <counter>: append sample, drop samples older than WINDOW,
@@ -149,8 +165,8 @@ nvidia_cycle() {
         db=$(( brk - ${LASTCNT[$k.brk]:-$brk} )); (( db < 0 )) && db=0
         LASTCNT[$k.pcap]=$pcap LASTCNT[$k.swt]=$swt LASTCNT[$k.hwt]=$hwt LASTCNT[$k.brk]=$brk
         # Alertable sw thermal time accrues only while the card is warm.
-        local swhot=$ds
-        [[ "$temp" =~ ^[0-9]+$ ]] && (( temp < SW_THERM_MIN_C )) && swhot=0
+        local swhot=0
+        [[ "$temp" =~ ^[0-9]+$ ]] && (( 10#$temp >= SW_THERM_MIN_C )) && swhot=$ds
         LASTCNT[$k.swhot]=$(( ${LASTCNT[$k.swhot]:-0} + swhot ))
         log "gpu=$idx bdf=$bdf name=\"$name\" core=${temp:-na} hot=${hot:-na} hot_sensor=${hreg:-na}" \
             "vram_chip=${chip:-na} vram_chip_c=${chipc:-na} chips=${nchips:-0} tlimit=${tl:-na} power_w=${pwr:-na}" \
@@ -184,13 +200,28 @@ nvidia_errors() {
             ROLL[$cur]=${BASH_REMATCH[1]}
         fi
     done < <(timeout 30 nvidia-smi -q 2>/dev/null)
-    # NVLink: "GPU n: ..." then "Link x: Replay Errors: v" etc.
+    # NVIDIA documents error labels across generations at:
+    # https://docs.nvidia.com/deploy/nvidia-smi/index.html#nvlink
+    # Accept integer error counters, never traffic totals or BER/throughput.
+    local field
     while IFS= read -r line; do
         if [[ "$line" =~ ^GPU\ ([0-9]+): ]]; then
             gpu=${BASH_REMATCH[1]}
-        elif [[ -n "$gpu" && "$line" =~ (Replay|Recovery|CRC)\ Errors:\ ([0-9]+) ]]; then
-            v=${BASH_REMATCH[2]}
-            NVL[$gpu.${BASH_REMATCH[1]}]=$(( ${NVL[$gpu.${BASH_REMATCH[1]}]:-0} + v ))
+            continue
+        fi
+        [[ -n "$gpu" ]] || continue
+        line=${line#"${line%%[![:space:]]*}"}
+        if [[ "$line" =~ ^Link[[:space:]]+[0-9]+:[[:space:]]*(.*)$ ]]; then
+            line=${BASH_REMATCH[1]}
+        fi
+        if [[ "$line" =~ ^([^:]+):[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+            field=${BASH_REMATCH[1]} v=${BASH_REMATCH[2]}
+            field=${field%"${field##*[![:space:]]}"}
+            case "$field" in
+                *Errors|*Errors\ -\ [0-9]|*Errors\ -\ 1[0-5]|"Tx discards"|"Link recovery successful events"|"Link recovery failed events") ;;
+                *) continue ;;
+            esac
+            NVL[$gpu.$field]=$(( ${NVL[$gpu.$field]:-0} + 10#$v ))
             NVL[$gpu.any]=1
         fi
     done < <(timeout 30 nvidia-smi nvlink -e 2>/dev/null)
@@ -198,7 +229,7 @@ nvidia_errors() {
     local bdf idx name k r rr aer_c aer_n aer_f f key val
     for bdf in "${!NAME[@]}"; do
         idx=${IDX[$bdf]} name=${NAME[$bdf]} k="gpu$idx"
-        r=${REPLAY[$bdf]:-} rr=${ROLL[$bdf]:-0}
+        r=${REPLAY[$bdf]:-} rr=${ROLL[$bdf]:-}
         aer_c='' aer_n='' aer_f=''
         for f in correctable:TOTAL_ERR_COR nonfatal:TOTAL_ERR_NONFATAL fatal:TOTAL_ERR_FATAL; do
             [[ -r "$PCI_SYSFS/$bdf/aer_dev_${f%%:*}" ]] || continue
@@ -206,13 +237,17 @@ nvidia_errors() {
                 [[ "$key" == "${f#*:}" ]] && printf -v "aer_${f:0:1}" '%s' "$val"
             done <"$PCI_SYSFS/$bdf/aer_dev_${f%%:*}"
         done
-        log "errors gpu=$idx bdf=$bdf pcie_replay=${r:-na} pcie_replay_rollover=$rr aer_cor=${aer_c:-na}" \
-            "aer_nonfatal=${aer_n:-na} aer_fatal=${aer_f:-na} nvlink_replay=${NVL[$idx.Replay]:-na}" \
-            "nvlink_recovery=${NVL[$idx.Recovery]:-na} nvlink_crc=${NVL[$idx.CRC]:-na}"
+        log "errors gpu=$idx bdf=$bdf pcie_replay=${r:-na} pcie_replay_rollover=${rr:-na} aer_cor=${aer_c:-na}" \
+            "aer_nonfatal=${aer_n:-na} aer_fatal=${aer_f:-na} nvlink_replay=${NVL[$idx.Replay Errors]:-na}" \
+            "nvlink_recovery=${NVL[$idx.Recovery Errors]:-na} nvlink_crc=${NVL[$idx.CRC Errors]:-na}"
         local d pcie_msg='' nvl_msg=''
         if [[ -n "$r" ]]; then
-            rise "$k.replay" $(( rr * 1000000 + r )); d=$RISE
-            (( d > 0 )) && pcie_msg+="PCIe replays +$d (total $r, rollovers $rr). "
+            rise "$k.replay_count" "$r"; d=$RISE
+            (( d > 0 )) && pcie_msg+="PCIe replays +$d (total $r). "
+        fi
+        if [[ -n "$rr" ]]; then
+            rise "$k.replay_rollover" "$rr"; d=$RISE
+            (( d > 0 )) && pcie_msg+="PCIe replay rollovers +$d (total $rr). "
         fi
         for f in c:correctable n:nonfatal f:fatal; do
             v=aer_${f%%:*}; v=${!v}
@@ -220,9 +255,12 @@ nvidia_errors() {
             rise "$k.aer_${f#*:}" "$v"; d=$RISE; (( d > 0 )) && pcie_msg+="AER ${f#*:} +$d (total $v). "
         done
         if [[ -n "${NVL[$idx.any]:-}" ]]; then
-            for f in Replay Recovery CRC; do
-                rise "$k.nvl_$f" "${NVL[$idx.$f]:-0}"; d=$RISE
-                (( d > 0 )) && nvl_msg+="NVLink $f errors +$d (total ${NVL[$idx.$f]}). "
+            for key in "${!NVL[@]}"; do
+                [[ "$key" == "$idx."* && "$key" != "$idx.any" ]] || continue
+                f=${key#*.}
+                log "nvlink gpu=$idx counter=\"$f\" total=${NVL[$key]}"
+                rise "$k.nvl_$f" "${NVL[$key]}"; d=$RISE
+                (( d > 0 )) && nvl_msg+="NVLink $f +$d (total ${NVL[$key]}). "
             done
         fi
         [[ -n "$pcie_msg" ]] && alert "$k.pcie" 4 "GPU PCIe errors: $HOST GPU$idx $name" "$pcie_msg
@@ -297,13 +335,15 @@ else
     log "no supported GPU found"
 fi
 
+deliver_pending
+
 if (( NOW - LAST_PRUNE >= 3600 )); then
     LAST_PRUNE=$NOW
     find "$LOG_DIR" -maxdepth 1 -name 'gpu-*.log' -mtime +"$KEEP_DAYS" -delete 2>/dev/null
 fi
 
 {
-    declare -p RING LAST_ALERT ERRBASE LASTCNT
+    declare -p RING LAST_ALERT ERRBASE LASTCNT PENDING_TITLE PENDING_BODY PENDING_PRIO LAST_ATTEMPT
     printf 'LAST_ERRPOLL=%s LAST_PRUNE=%s\n' "$LAST_ERRPOLL" "$LAST_PRUNE"
 } >"$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
 exit 0

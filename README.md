@@ -140,13 +140,20 @@ timer that is separate from the Beszel publisher:
   and slowdown seconds per reason since the previous sample;
 - sends ntfy (`/etc/ntfy.env`, `NTFY_URL` + `NTFY_AUTH=user:password`) when
   thermal or power-brake slowdown exceeds 30 s in 5 min (power cap is logged
-  only), or when PCIe replays, PCIe AER totals or NVLink replay/recovery/CRC
-  errors rise (polled every 5 min). One alert per card and kind per hour;
+  only). Software thermal time counts only with a valid core temperature at
+  or above 70 C (`GPU_HEALTH_SW_THERM_MIN_C`), never with `[N/A]`;
+- alerts when PCIe replay or rollover counters, PCIe AER totals, or NVLink
+  error counters rise (polled every 5 min). Replays and rollovers have separate
+  deltas. NVLink 1 through 5 error counters are parsed; traffic and BER rates
+  are excluded. One successfully delivered alert per card and kind per hour.
+  Failed alerts stay pending, with at most one retry per key per minute,
+  including one-shot errors that no longer rise;
 - on Jetson (no NVML), logs the hottest thermal zone, margin to the 99 C
   throttle trip, active throttle alerts and soctherm over-current counters,
   and alerts on > 30 s of throttling in 5 min or any new over-current event.
 
-Tests: `tests/health-watch.sh` (fake nvidia-smi/sysfs) and `tests/detail.c`.
+Tests: `tests/health-watch.sh` and `tests/health-regressions.sh` (fake nvidia-smi,
+ntfy and sysfs), plus `tests/detail.c` and `tests/ga107.c`.
 
 ## Layout
 

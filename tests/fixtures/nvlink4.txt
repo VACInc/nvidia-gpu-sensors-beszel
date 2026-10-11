@@ -1,0 +1,9 @@
+GPU 3: Fixture GPU
+    Link 0: Replay Errors: @COUNT@
+    Link 0: Recovery Errors: @COUNT@
+    Link 0: CRC Errors: @COUNT@
+    Link 1: Replay Errors: @COUNT@
+    Link 1: Recovery Errors: @COUNT@
+    Link 1: CRC Errors: @COUNT@
+    Link 0: Tx bytes: @TRAFFIC@
+    Link 0: Rx bytes: @TRAFFIC@

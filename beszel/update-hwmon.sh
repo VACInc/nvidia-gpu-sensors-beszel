@@ -60,6 +60,8 @@ write_sensor() {  # write_sensor <dirnum> <display-name> <degC>
     written[$1]=1
 }
 
+# All CSV columns must be consumed, but this exporter only uses mem and hot.
+# shellcheck disable=SC2034
 while IFS=, read -r bdf core mem hot v0 v1; do
     name="${GPU_NAME[$bdf]:-}"
     [ -n "$name" ] || continue
