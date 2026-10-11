@@ -56,6 +56,23 @@ echo 4 >"$T/replay"; retry_due; poll
 [[ $(wc -l <"$T/attempts") == 2 ]] || fail "success cooldown ignored"
 echo 'ok - failed delivery retries once due, then cooldown'
 
+# New metrics in the same family must not overwrite undelivered one-shot
+# faults. Repeated rises coalesce without an unbounded message queue.
+reset_case coalescing
+mkdir -p "$T/pci/0000:41:00.0"
+echo 'TOTAL_ERR_FATAL 0' >"$T/pci/0000:41:00.0/aer_dev_fatal"
+run
+echo fail >"$T/send"
+echo 'TOTAL_ERR_FATAL 1' >"$T/pci/0000:41:00.0/aer_dev_fatal"; poll
+echo 3 >"$T/replay"; poll
+echo 8 >"$T/replay"; poll
+( source "$STATE_DIR/state"; [[ ${#PENDING_DETAILS[@]} == 2 ]] ) || fail "pending counters not bounded by kind"
+echo success >"$T/send"; retry_due; run
+grep -q 'AER fatal +1 (total 1)' "$T/delivered" || fail "one-shot fatal event overwritten"
+grep -q 'PCIe replays +8 (total 8)' "$T/delivered" || fail "pending replay rises not coalesced"
+( source "$STATE_DIR/state"; [[ ${#PENDING_DETAILS[@]} == 0 && ${#PENDING_RISE[@]} == 0 ]] ) || fail "delivered counters retained"
+echo 'ok - distinct pending counters preserved, repeated rises coalesced'
+
 reset_case rollovers
 echo 900 >"$T/replay"; echo 7 >"$T/roll"; run
 echo 903 >"$T/replay"; echo 8 >"$T/roll"; poll

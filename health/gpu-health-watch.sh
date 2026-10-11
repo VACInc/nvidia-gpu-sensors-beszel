@@ -59,6 +59,7 @@ HOST="${HOSTNAME%%.*}"
 # Persistent state (declare -p dump of these arrays and scalars).
 declare -A RING=() LAST_ALERT=() ERRBASE=() LASTCNT=()
 declare -A PENDING_TITLE=() PENDING_BODY=() PENDING_PRIO=() LAST_ATTEMPT=()
+declare -A PENDING_DETAILS=() PENDING_RISE=()
 WDELTA=0 RISE=0
 LAST_ERRPOLL=0 LAST_PRUNE=0
 # shellcheck disable=SC1090
@@ -74,29 +75,59 @@ fi
 
 # alert <key> <priority> <title> <body>; rate limited per key.
 alert() {
-    local key=$1 prio=$2 title=$3 body=$4
+    local key=$1 prio=$2 title=$3 body=$4 event=${5:-}
     if (( NOW - ${LAST_ALERT[$key]:-0} < REALERT )); then
         log "alert-suppressed key=$key title=\"$title\""
         return 0
     fi
     log "alert key=$key title=\"$title\" body=\"${body//$'\n'/ | }\""
-    PENDING_TITLE[$key]=$title PENDING_BODY[$key]=$body PENDING_PRIO[$key]=$prio
+    PENDING_TITLE[$key]=$title PENDING_PRIO[$key]=$prio
+    if [[ -n "$event" ]]; then
+        PENDING_DETAILS[$key'|'$event]=$body
+    else
+        PENDING_BODY[$key]=$body
+    fi
+}
+
+# Keep distinct counters until delivery, coalescing repeated rises of the same
+# counter. Queue size is bounded by counter kinds, not outage length.
+counter_alert() {
+    local key=$1 title=$2 metric=$3 delta=$4 total=$5 context=$6 event sum
+    (( delta > 0 )) || return 0
+    if (( NOW - ${LAST_ALERT[$key]:-0} < REALERT )); then
+        log "alert-suppressed key=$key title=\"$title\""
+        return 0
+    fi
+    event="$key|$metric"
+    sum=$(( ${PENDING_RISE[$event]:-0} + delta ))
+    PENDING_RISE[$event]=$sum
+    alert "$key" 4 "$title" "$metric +$sum (total $total)." "$metric"
+    PENDING_BODY[$key]=$context
 }
 
 # Persist failed one-shot counter alerts too. Retry once per key per minute,
 # even if the counter stops rising; successful sends alone start the cooldown.
 deliver_pending() {
-    local key
+    local key event body
     for key in "${!PENDING_TITLE[@]}"; do
         (( NOW - ${LAST_ATTEMPT[$key]:-0} >= RETRY_EVERY )) || continue
         LAST_ATTEMPT[$key]=$NOW
         [[ -n "$NTFY_URL" ]] || { log "alert-not-sent reason=no-ntfy-env key=$key"; continue; }
+        body=${PENDING_BODY[$key]:-}
+        for event in "${!PENDING_DETAILS[@]}"; do
+            [[ "$event" == "$key|"* ]] || continue
+            body+="${body:+$'\n'}${PENDING_DETAILS[$event]}"
+        done
         # NTFY_AUTH stays off curl's argv. Never log curl's potentially sensitive diagnostics.
         if curl -fsS -m 15 -o /dev/null --config <(printf 'user = "%s"\n' "$NTFY_AUTH") \
             -H "Title: ${PENDING_TITLE[$key]}" -H "Priority: ${PENDING_PRIO[$key]}" \
-            -H "Tags: no-repair,thermometer" --data-binary "${PENDING_BODY[$key]}" "$NTFY_URL" 2>/dev/null; then
+            -H "Tags: no-repair,thermometer" --data-binary "$body" "$NTFY_URL" 2>/dev/null; then
             LAST_ALERT[$key]=$NOW
             unset 'PENDING_TITLE[$key]' 'PENDING_BODY[$key]' 'PENDING_PRIO[$key]'
+            for event in "${!PENDING_DETAILS[@]}"; do
+                [[ "$event" == "$key|"* ]] || continue
+                unset 'PENDING_DETAILS[$event]' 'PENDING_RISE[$event]'
+            done
         else
             log "alert-send-failed key=$key"
         fi
@@ -240,19 +271,21 @@ nvidia_errors() {
         log "errors gpu=$idx bdf=$bdf pcie_replay=${r:-na} pcie_replay_rollover=${rr:-na} aer_cor=${aer_c:-na}" \
             "aer_nonfatal=${aer_n:-na} aer_fatal=${aer_f:-na} nvlink_replay=${NVL[$idx.Replay Errors]:-na}" \
             "nvlink_recovery=${NVL[$idx.Recovery Errors]:-na} nvlink_crc=${NVL[$idx.CRC Errors]:-na}"
-        local d pcie_msg='' nvl_msg=''
+        local d pcie_title="GPU PCIe errors: $HOST GPU$idx $name" nvl_title="GPU NVLink errors: $HOST GPU$idx $name"
+        local context="BDF $bdf. Log: $LOG"
         if [[ -n "$r" ]]; then
             rise "$k.replay_count" "$r"; d=$RISE
-            (( d > 0 )) && pcie_msg+="PCIe replays +$d (total $r). "
+            counter_alert "$k.pcie" "$pcie_title" "PCIe replays" "$d" "$r" "$context"
         fi
         if [[ -n "$rr" ]]; then
             rise "$k.replay_rollover" "$rr"; d=$RISE
-            (( d > 0 )) && pcie_msg+="PCIe replay rollovers +$d (total $rr). "
+            counter_alert "$k.pcie" "$pcie_title" "PCIe replay rollovers" "$d" "$rr" "$context"
         fi
         for f in c:correctable n:nonfatal f:fatal; do
             v=aer_${f%%:*}; v=${!v}
             [[ -n "$v" ]] || continue
-            rise "$k.aer_${f#*:}" "$v"; d=$RISE; (( d > 0 )) && pcie_msg+="AER ${f#*:} +$d (total $v). "
+            rise "$k.aer_${f#*:}" "$v"; d=$RISE
+            counter_alert "$k.pcie" "$pcie_title" "AER ${f#*:}" "$d" "$v" "$context"
         done
         if [[ -n "${NVL[$idx.any]:-}" ]]; then
             for key in "${!NVL[@]}"; do
@@ -260,13 +293,9 @@ nvidia_errors() {
                 f=${key#*.}
                 log "nvlink gpu=$idx counter=\"$f\" total=${NVL[$key]}"
                 rise "$k.nvl_$f" "${NVL[$key]}"; d=$RISE
-                (( d > 0 )) && nvl_msg+="NVLink $f +$d (total ${NVL[$key]}). "
+                counter_alert "$k.nvlink" "$nvl_title" "NVLink $f" "$d" "${NVL[$key]}" "$context"
             done
         fi
-        [[ -n "$pcie_msg" ]] && alert "$k.pcie" 4 "GPU PCIe errors: $HOST GPU$idx $name" "$pcie_msg
-BDF $bdf. Log: $LOG"
-        [[ -n "$nvl_msg" ]] && alert "$k.nvlink" 4 "GPU NVLink errors: $HOST GPU$idx $name" "$nvl_msg
-BDF $bdf. Log: $LOG"
     done
 }
 
@@ -287,7 +316,6 @@ jetson_cycle() {
         { read -r st <"$c/cur_state"; } 2>/dev/null || continue
         (( st > 0 )) && { active+="${ctype%-throttle-alert}:$st "; nact=$(( nact + 1 )); }
     done
-    local ocmsg=''
     for h in "$HWMON_SYSFS"/hwmon*; do
         { read -r n <"$h/name"; } 2>/dev/null || continue
         [[ "$n" == soctherm_oc ]] || continue
@@ -298,7 +326,7 @@ jetson_cycle() {
             oc+="$n=$v "
             local d
             rise "jetson.$n" "$v"; d=$RISE
-            (( d > 0 )) && ocmsg+="$n over-current events +$d (total $v). "
+            counter_alert jetson.oc "Jetson over-current throttle: $HOST" "$n over-current events" "$d" "$v" "Log: $LOG"
         done
     done
     local margin=na
@@ -315,8 +343,6 @@ jetson_cycle() {
 Hottest zone $hotname $(( hot / 1000 )) C, margin to 99 C trip ${margin} C.
 Log: $LOG"
     fi
-    [[ -n "$ocmsg" ]] && alert jetson.oc 4 "Jetson over-current throttle: $HOST" "$ocmsg
-Log: $LOG"
 }
 
 # Tegra first: JetPack 7 ships an nvidia-smi for the integrated GPU, but it
@@ -343,7 +369,7 @@ if (( NOW - LAST_PRUNE >= 3600 )); then
 fi
 
 {
-    declare -p RING LAST_ALERT ERRBASE LASTCNT PENDING_TITLE PENDING_BODY PENDING_PRIO LAST_ATTEMPT
+    declare -p RING LAST_ALERT ERRBASE LASTCNT PENDING_TITLE PENDING_BODY PENDING_PRIO LAST_ATTEMPT PENDING_DETAILS PENDING_RISE
     printf 'LAST_ERRPOLL=%s LAST_PRUNE=%s\n' "$LAST_ERRPOLL" "$LAST_PRUNE"
 } >"$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
 exit 0
