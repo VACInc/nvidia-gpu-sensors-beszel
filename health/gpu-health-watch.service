@@ -13,3 +13,15 @@ ProtectSystem=full
 LogsDirectory=gpu-health
 StateDirectory=gpu-health-watch
 StateDirectoryMode=0700
+# Sandbox. Runs as root for BAR0 and /dev/nvidia*, so no PrivateDevices,
+# DeviceAllow or ProtectClock (which implies a device allow-list), and the
+# capability set is left alone. curl needs IP for ntfy.
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
