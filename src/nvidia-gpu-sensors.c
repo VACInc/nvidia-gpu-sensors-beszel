@@ -627,6 +627,27 @@ static void on_sigint(int s)
     g_stop = 1;
 }
 
+static void rm_free(NvHandle hClient, NvHandle hObject)
+{
+    NVOS00 f = {0};
+    f.hRoot = hClient;
+    f.hObjectOld = hObject;
+    nv_ioctl(NV_ESC_RM_FREE, &f, sizeof f);
+}
+
+/* Undo a partial gpu_setup(). The handles are derived from the slot index, so
+ * a device object left behind by a failed GPU would make the next GPU's alloc
+ * collide with it; the device fd would also leak. Freeing the device frees its
+ * subdevice and RUSD children. */
+static void gpu_setup_abort(GPU *g, int haveDevice)
+{
+    if (haveDevice)
+        rm_free(g->hClient, g->hDevice);
+    if (g->devFd >= 0)
+        close(g->devFd);
+    g->devFd = -1;
+}
+
 /* Bring a single GPU up to a mapped RUSD page + VOLT rail mask. */
 static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
 {
@@ -703,6 +724,7 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
                  &rmStatus)) {
         fprintf(stderr, "gpuId 0x%08x: rm_alloc NV01_DEVICE_0 failed (RM status 0x%08x)\n",
                 gpuId, rmStatus);
+        gpu_setup_abort(g, 0);
         return -1;
     }
     g->hSubdev = 0xCB000003 + index * 0x10;
@@ -712,6 +734,7 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
                  &rmStatus)) {
         fprintf(stderr, "gpuId 0x%08x: rm_alloc NV20_SUBDEVICE_0 failed (RM status 0x%08x)\n",
                 gpuId, rmStatus);
+        gpu_setup_abort(g, 1);
         return -1;
     }
 
@@ -727,11 +750,14 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
         m.offset = 0;
         m.length = RUSD_SIZE;
         m.fd = mapfd;
-        if (nv_ioctl(NV_ESC_RM_MAP_MEMORY, &m, sizeof m) == 0 && m.status == 0) {
+        if (mapfd >= 0 && nv_ioctl(NV_ESC_RM_MAP_MEMORY, &m, sizeof m) == 0 && m.status == 0) {
             void *p = mmap(NULL, RUSD_SIZE, PROT_READ, MAP_SHARED, mapfd, 0);
             if (p != MAP_FAILED)
                 g->rusd = p;
         }
+        /* On success the fd stays with the mapping; otherwise don't leak it. */
+        if (!g->rusd && mapfd >= 0)
+            close(mapfd);
         NvU32 pollMask[2] = { POLL_ALL, 0 };
         rm_control(hClient, g->hRusd, NV00DE_CTRL_CMD_REQUEST_DATA_POLL, pollMask, sizeof pollMask,
                    NULL);
@@ -962,10 +988,7 @@ int main(int argc, char **argv)
         if (gpus[i].bar0)
             munmap((void *)gpus[i].bar0, BAR0_MAP_LEN);
     }
-    NVOS00 f = {0};
-    f.hRoot = hClient;
-    f.hObjectOld = hClient;
-    nv_ioctl(NV_ESC_RM_FREE, &f, sizeof f);
+    rm_free(hClient, hClient);
     close(g_fd);
     return 0;
 }
