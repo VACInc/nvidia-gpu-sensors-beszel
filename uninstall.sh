@@ -6,6 +6,8 @@ AGENT_UNIT="${BESZEL_AGENT_UNIT:-beszel-agent}"
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 
 systemctl disable --now gpu-hotspot-hwmon.timer 2>/dev/null || true
+# A run already in flight would recreate /run/gpu-sensors-sys after the rm below.
+systemctl stop gpu-hotspot-hwmon.service 2>/dev/null || true
 rm -f /etc/systemd/system/gpu-hotspot-hwmon.service \
       /etc/systemd/system/gpu-hotspot-hwmon.timer \
       "/etc/systemd/system/${AGENT_UNIT}.service.d/30-sys-sensors.conf"
