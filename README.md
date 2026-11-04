@@ -138,10 +138,13 @@ timer that is separate from the Beszel publisher:
 - logs one line per card to `/var/log/gpu-health/gpu-YYYY-MM-DD.log` (30 days):
   core, hot spot and its sensor register, hottest VRAM chip, T.Limit, power,
   and slowdown seconds per reason since the previous sample;
-- sends ntfy (`/etc/ntfy.env`, `NTFY_URL` + `NTFY_AUTH=user:password`) when
+- sends ntfy (`/etc/ntfy.env`, `NTFY_URL` + optional `NTFY_AUTH=user:password`) when
   thermal or power-brake slowdown exceeds 30 s in 5 min (power cap is logged
-  only). Software thermal time counts only with a valid core temperature at
-  or above 70 C (`GPU_HEALTH_SW_THERM_MIN_C`), never with `[N/A]`;
+  only). The file is parsed, not sourced: one `KEY=value` per line, value
+  literal or in one pair of quotes, no shell expansion. URL and credentials
+  go to curl through its config, not its command line. Software thermal
+  time counts only with a valid core temperature at or above 70 C
+  (`GPU_HEALTH_SW_THERM_MIN_C`), never with `[N/A]`;
 - alerts when PCIe replay or rollover counters, PCIe AER totals, or NVLink
   error counters rise (polled every 5 min). Replays and rollovers have separate
   deltas. NVLink 1 through 5 error counters are parsed; traffic and BER rates
