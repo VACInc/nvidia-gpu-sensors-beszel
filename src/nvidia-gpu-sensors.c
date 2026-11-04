@@ -292,26 +292,28 @@ static int rm_control(NvHandle hClient, NvHandle hObject, NvU32 cmd, void *param
 }
 
 /* Read one RUSD temperature entry with the timestamp seqlock guard.
- * Returns 1 and sets *out (degC) on success, 0 if the sensor is unavailable. */
+ * Returns 1 and sets *out (degC) on success, 0 if the sensor is unavailable or
+ * no consistent snapshot was seen within the retry budget. A writer stuck in
+ * progress or a timestamp that never settles must not surface as 0 C or as a
+ * torn value. */
 static int read_temp(volatile uint8_t *rusd, int sensor, double *out)
 {
     const volatile uint8_t *e = rusd + RUSD_TEMPS_OFF + sensor * RUSD_TEMP_STRIDE;
-    uint64_t ts = 0;
-    int32_t raw = 0;
     for (int tries = 0; tries < 200; tries++) {
-        ts = *(volatile uint64_t *)e;
+        uint64_t ts = *(volatile uint64_t *)e;
         if (ts == RUSD_TS_WRITE_IN_PROGRESS) {
             usleep(1000);
             continue;
         }
-        raw = *(volatile int32_t *)(e + RUSD_TEMP_VALUE);
-        if (*(volatile uint64_t *)e == ts)
-            break;
+        int32_t raw = *(volatile int32_t *)(e + RUSD_TEMP_VALUE);
+        if (*(volatile uint64_t *)e != ts)
+            continue;
+        if (ts == RUSD_TS_INVALID)
+            return 0;
+        *out = raw / 256.0;
+        return 1;
     }
-    if (ts == RUSD_TS_INVALID)
-        return 0;
-    *out = raw / 256.0;
-    return 1;
+    return 0;
 }
 
 /* Per-GPU handles + mapped RUSD page, set up once and reused across samples. */
