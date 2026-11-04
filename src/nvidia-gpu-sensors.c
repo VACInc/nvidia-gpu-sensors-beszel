@@ -85,7 +85,7 @@
  * much can put the GPU into a state where it needs a reset (NV_ERR_RESET_REQUIRED).
  */
 #define BAR0_MAP_LEN     0x00AD1000u   /* enough to cover NV_THERM, nothing more */
-#define NV_PMC_BOOT_0    0x0u          /* chip id = (boot0 >> 20); safe read on any GPU */
+#define NV_PMC_BOOT_0    0x0u          /* chip id = bits 28:20; safe read on any GPU */
 
 /* Column widths for the readout table. */
 #define W_TEMP 10
@@ -332,15 +332,22 @@ typedef struct {
 
 enum { ARCH_NONE = 0, ARCH_BLACKWELL, ARCH_AMPERE, ARCH_AMPERE_GA107 };
 
+/* Chipset id as Linux nouveau extracts it. Bits above 28 are not part of the
+ * id: GA107 reads back 0xb77000a1, so an unmasked shift yields 0xb77. */
+static unsigned boot0_chipset(uint32_t boot0)
+{
+    return (boot0 & 0x1ff00000u) >> 20;
+}
+
 static int is_blackwell(uint32_t boot0)
 {
-    unsigned chip = boot0 >> 20;
+    unsigned chip = boot0_chipset(boot0);
     return chip >= 0x1B0 && chip <= 0x1BF;   /* GB202/3/5/6/7 */
 }
 
 static int is_ga107(uint32_t boot0)
 {
-    return ((boot0 & 0x1ff00000u) >> 20) == 0x177;
+    return boot0_chipset(boot0) == 0x177;
 }
 
 /* Read the PCI device id of a GPU from sysfs. Returns 0 if unavailable. */
