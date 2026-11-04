@@ -12,11 +12,16 @@ command -v gcc >/dev/null || { echo "gcc not found" >&2; exit 1; }
 
 echo "building..."
 mkdir -p /opt/gpu-hotspot/bin /opt/gpu-hotspot/src
-gcc -O2 -Wall -o /opt/gpu-hotspot/bin/nvidia-gpu-sensors "$HERE/src/nvidia-gpu-sensors.c"
-cp "$HERE/src/nvidia-gpu-sensors.c" "$HERE/src/meson.build" /opt/gpu-hotspot/src/
+# Build next to the live binary and rename over it: on a re-run the 30 s timer
+# can fire mid-link and find the binary missing or half written, and a binary
+# that fails the smoke test must never replace a working one.
+BIN=/opt/gpu-hotspot/bin/nvidia-gpu-sensors
+gcc -std=gnu11 -O2 -Wall -Wextra -o "$BIN.new" "$HERE/src/nvidia-gpu-sensors.c"
 
 echo "smoke test (one-shot read)..."
-/opt/gpu-hotspot/bin/nvidia-gpu-sensors --csv
+"$BIN.new" --csv || { rm -f "$BIN.new"; echo "smoke test failed; installed binary unchanged" >&2; exit 1; }
+mv -f "$BIN.new" "$BIN"
+cp "$HERE/src/nvidia-gpu-sensors.c" "$HERE/src/meson.build" /opt/gpu-hotspot/src/
 
 install -m755 "$HERE/beszel/update-hwmon.sh" /opt/gpu-hotspot/
 install -m644 "$HERE/beszel/gpu-hotspot-hwmon.service" \
@@ -30,6 +35,8 @@ systemctl start gpu-hotspot-hwmon.service
 
 echo "published sensors:"
 for d in /run/gpu-sensors-sys/class/hwmon/hwmon9*; do
+    # No match leaves the literal glob: report that instead of a cat error.
+    [ -e "$d" ] || { echo "  (none: no supported hotspot/VRAM/T.Limit reading)"; continue; }
     [ -L "$d" ] || echo "  $(cat "$d/name") = $(awk '{printf "%.1f °C", $1/1000}' "$d/temp1_input")"
 done
 
