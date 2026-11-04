@@ -853,6 +853,12 @@ int main(int argc, char **argv)
             printf("    (hottest die sensor register and hottest GDDR chip, e.g. D1B = partition D chip 1 back).\n");
             return 0;
         }
+        else {
+            /* A typo such as --cvs must not silently fall back to the table,
+             * which scripts would then misparse. */
+            fprintf(stderr, "%s: unknown option '%s' (try --help)\n", argv[0], argv[i]);
+            return 2;
+        }
     }
     if (g_color && !isatty(1))
         g_color = 0;
