@@ -219,6 +219,13 @@ forget_gpu() {
     return 0
 }
 
+# mc_to_c <millidegrees>: one-decimal C, sign kept for -0.9..-0.1 C.
+mc_to_c() {
+    local a=$(( $1 < 0 ? -$1 : $1 )) sign=''
+    (( $1 < 0 )) && sign=-
+    printf '%s%d.%d' "$sign" $(( a / 1000 )) $(( a % 1000 / 100 ))
+}
+
 us_to_s() { printf '%d.%01d' $(( $1 / 1000000 )) $(( $1 % 1000000 / 100000 )); }
 
 nvidia_cycle() {
@@ -376,7 +383,7 @@ jetson_cycle() {
         # gpu/cv zones return ENODATA while their rail is gated.
         { read -r t <"$z/temp"; } 2>/dev/null || continue
         [[ "$t" =~ ^-?[0-9]+$ ]] || continue
-        zones+="${type%-thermal}=$(( t / 1000 )).$(( (t < 0 ? -t : t) % 1000 / 100 )) "
+        zones+="${type%-thermal}=$(mc_to_c "$t") "
         (( t > hot )) && { hot=$t; hotname=${type%-thermal}; }
     done
     for c in "$THERMAL_SYSFS"/cooling_device*; do
@@ -398,9 +405,13 @@ jetson_cycle() {
             counter_alert jetson.oc "Jetson over-current throttle: $HOST" "$n over-current events" "$d" "$v" "Log: $LOG"
         done
     done
-    local margin=na
-    (( hot > -999999 )) && margin=$(( (JETSON_TRIP_MC - hot) / 1000 ))
-    log "jetson hottest=$hotname hot=$(( hot / 1000 )).$(( hot % 1000 / 100 )) throttle_margin=$margin" \
+    # No readable zone: report na, not the -999999 sentinel as "-999.-9".
+    local margin=na hotc=na
+    if (( hot > -999999 )); then
+        margin=$(( (JETSON_TRIP_MC - hot) / 1000 ))
+        hotc=$(mc_to_c "$hot")
+    fi
+    log "jetson hottest=${hotname:-na} hot=$hotc throttle_margin=$margin" \
         "throttle_active=\"${active% }\" oc=\"${oc% }\" zones=\"${zones% }\""
     # Every active-alert sample counts as one full 30 s interval.
     local acc=$(( ${LASTCNT[jetson.thr]:-0} + (nact > 0 ? 30000000 : 0) )) w
@@ -409,7 +420,7 @@ jetson_cycle() {
     if (( w > SLOW_LIMIT_US )); then
         alert jetson.thr 4 "Jetson throttling: $HOST" \
 "Thermal throttle alerts active for about $(( w / 1000000 )) s in the last 5 min: ${active:-cleared}.
-Hottest zone $hotname $(( hot / 1000 )) C, margin to 99 C trip ${margin} C.
+Hottest zone ${hotname:-na} $hotc C, margin to 99 C trip ${margin} C.
 Log: $LOG"
     fi
 }
