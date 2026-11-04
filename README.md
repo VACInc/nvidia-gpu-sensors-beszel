@@ -86,6 +86,16 @@ Builds the tool, installs to `/opt/gpu-hotspot/`, enables
 `gpu-hotspot-hwmon.timer`, adds the `SYS_SENSORS` drop-in, and restarts the
 agent. Idempotent; survives reboots. Remove with `sudo ./uninstall.sh`.
 
+If the agent's unit is not called `beszel-agent`, pass its name:
+`sudo BESZEL_AGENT_UNIT=my-agent ./install.sh` (and the same for
+`uninstall.sh`). The drop-in only reaches a systemd-managed agent; an agent in
+a container needs `SYS_SENSORS=/run/gpu-sensors-sys` and that directory (plus
+the `/sys` paths its symlinks point to) made visible to it by hand.
+
+The health watch below is installed and removed separately:
+`sudo health/install.sh`, `sudo health/uninstall.sh` (logs in
+`/var/log/gpu-health` are kept).
+
 ## Verified hardware
 
 | GPU | Chip | Hotspot | VRAM temp |
@@ -94,8 +104,9 @@ agent. Idempotent; survives reboots. Remove with `sudo ./uninstall.sh`.
 | GeForce RTX 5090 | GB202 | yes | yes |
 | GeForce RTX 5060 Ti | GB206 | yes | yes |
 | GeForce RTX 3090 | GA102 | yes | yes |
+| GeForce RTX 3050 6GB (`10de:2584`) | GA107 | yes | no (see below) |
 
-Driver 610.43.02 on all of the above. Community reports of `n/a` hotspot on
+Driver 610.43.02 on all of the above (RTX 3050: 610.57.04). Community reports of `n/a` hotspot on
 GB203/GB206 appear to be driver-version related (595.x); 610.x works here.
 
 Ampere uses a different layout and is handled separately: the on-die sensors
@@ -114,12 +125,21 @@ an unlisted card degrades to `n/a` instead of reading unknown registers.
 - The tool is **read-only**: BAR0 is mmapped read-only and every RM ioctl is a
   query. There is no path that writes to the GPU or to persistent state.
 - The upstream author cautions that reading beyond the known register windows
-  can put a GPU into a state that needs a reset; this tool maps only the
-  minimal NV_THERM window and gates Blackwell-only offsets on the chip ID.
+  can put a GPU into a state that needs a reset. The tool maps BAR0 from 0 up
+  to the end of the NV_THERM window (`0xAD1000`), but only reads the chip ID,
+  the listed thermal sensors and, with `--detail`, the GDDR temperature block;
+  architecture-specific offsets are gated on the chip ID (and on the PCI
+  device ID for Ampere). Per-chip GDDR reads are enabled for every GB20x and
+  listed Ampere board but were validated only on the chips named below.
   Many thousands of 30-second one-shot cycles across mixed Ampere/Blackwell
   fleets have been uneventful for us.
 - Not affiliated with NVIDIA. The interfaces are unofficial and may change in
   future drivers.
+- Trust model: both timers run as root every 30 s. They execute
+  `nvidia-smi` and the built helper, read sysfs, write only below
+  `/run/gpu-sensors-sys`, `/var/log/gpu-health` and
+  `/var/lib/gpu-health-watch`, and read `/etc/ntfy.env`, which should be
+  root-owned and not group/world-writable since it holds the ntfy credential.
 
 ## Per-chip VRAM and the health watch
 
@@ -155,8 +175,9 @@ timer that is separate from the Beszel publisher:
   throttle trip, active throttle alerts and soctherm over-current counters,
   and alerts on > 30 s of throttling in 5 min or any new over-current event.
 
-Tests: `tests/health-watch.sh` and `tests/health-regressions.sh` (fake nvidia-smi,
-ntfy and sysfs), plus `tests/detail.c` and `tests/ga107.c`.
+Tests: `tests/run.sh` runs everything without a GPU: a `-Werror` build,
+shellcheck, the C tests (`tests/*.c`, under ASan/UBSan) and the shell tests
+(`tests/*.sh`, against a fake nvidia-smi, ntfy and sysfs).
 
 ## Layout
 
