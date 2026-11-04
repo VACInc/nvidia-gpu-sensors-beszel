@@ -7,3 +7,19 @@ ExecStart=/opt/gpu-hotspot/update-hwmon.sh
 # Oneshot units have no start timeout by default; a hung reader would keep the
 # unit activating forever and the timer would never fire again.
 TimeoutStartSec=60
+# Sandbox. Runs as root for BAR0 and /dev/nvidia*, so no PrivateDevices,
+# DeviceAllow or ProtectClock (which implies a device allow-list), and the
+# capability set is left alone. It only writes /run/gpu-sensors-sys.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
