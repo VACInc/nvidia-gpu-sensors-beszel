@@ -188,6 +188,17 @@ rise() {
     return 0
 }
 
+# forget_gpu <key>: drop every baseline, window and cooldown kept for a card
+# key (e.g. gpu3), so the next sample starts fresh.
+forget_gpu() {
+    local p=$1. key
+    for key in "${!LASTCNT[@]}"; do [[ "$key" == "$p"* ]] && unset 'LASTCNT[$key]'; done
+    for key in "${!ERRBASE[@]}"; do [[ "$key" == "$p"* ]] && unset 'ERRBASE[$key]'; done
+    for key in "${!RING[@]}"; do [[ "$key" == "$p"* ]] && unset 'RING[$key]'; done
+    for key in "${!LAST_ALERT[@]}"; do [[ "$key" == "$p"* ]] && unset 'LAST_ALERT[$key]'; done
+    return 0
+}
+
 us_to_s() { printf '%d.%01d' $(( $1 / 1000000 )) $(( $1 % 1000000 / 100000 )); }
 
 nvidia_cycle() {
@@ -203,6 +214,7 @@ nvidia_cycle() {
         idx=${idx// /} name=${name# } name=${name#NVIDIA }
         bus=${bus// /} bus=${bus,,} bdf=${bus: -12}
         [[ "$bdf" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] || continue
+        [[ "$idx" =~ ^[0-9]{1,3}$ ]] || continue
         temp=${temp// /} tl=${tl// /} pwr=${pwr// /}
         pcap=${pcap// /} swt=${swt// /} hwt=${hwt// /} brk=${brk// /}
         [[ "$pcap" =~ ^[0-9]+$ ]] || pcap=0
@@ -218,6 +230,14 @@ nvidia_cycle() {
         fi
         [[ "$tl" =~ ^-?[0-9]+$ ]] || tl=''
         local k="gpu$idx" dp ds dh db
+        # State is keyed by nvidia-smi index, which shifts when a GPU drops off
+        # the bus or the topology changes. Comparing another card's counters
+        # would fake (or hide) slowdown and link-error rises: start over.
+        if [[ "${LASTCNT[$k.bdf]:-$bdf}" != "$bdf" ]]; then
+            log "gpu=$idx bdf=$bdf previous_bdf=${LASTCNT[$k.bdf]} state=reset"
+            forget_gpu "$k"
+        fi
+        LASTCNT[$k.bdf]=$bdf
         dp=$(( pcap - ${LASTCNT[$k.pcap]:-$pcap} )); (( dp < 0 )) && dp=0
         ds=$(( swt - ${LASTCNT[$k.swt]:-$swt} )); (( ds < 0 )) && ds=0
         dh=$(( hwt - ${LASTCNT[$k.hwt]:-$hwt} )); (( dh < 0 )) && dh=0
