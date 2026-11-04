@@ -67,11 +67,36 @@ LAST_ERRPOLL=0 LAST_PRUNE=0
 
 log() { printf '%s %s\n' "$STAMP" "$*" >>"$LOG"; }
 
+# ntfy.env is parsed, never sourced: this runs as root every 30 s, so sourcing
+# would execute whatever the file contains. Accepted: NTFY_URL= and NTFY_AUTH=
+# lines (optionally "export "), value literal or wrapped in one pair of single
+# or double quotes. No shell expansion; other lines are ignored.
 NTFY_URL='' NTFY_AUTH=''
-if [[ -r "$NTFY_ENV" ]]; then
-    # shellcheck disable=SC1090
-    source "$NTFY_ENV"
-fi
+load_ntfy_env() {
+    local line key val
+    [[ -r "$NTFY_ENV" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?(NTFY_URL|NTFY_AUTH)=(.*)$ ]] || continue
+        key=${BASH_REMATCH[2]} val=${BASH_REMATCH[3]}
+        if [[ "$val" =~ ^\"(.*)\"[[:space:]]*$ || "$val" =~ ^\'(.*)\'[[:space:]]*$ ]]; then
+            val=${BASH_REMATCH[1]}
+        else
+            val=${val%"${val##*[![:space:]]}"}
+        fi
+        printf -v "$key" '%s' "$val"
+    done <"$NTFY_ENV"
+}
+load_ntfy_env
+
+# curl_cfg <option> <value>: one curl config line with the value quoted, so a
+# '"' or '\' in a password cannot end the string and inject curl options
+# (e.g. output = /etc/...). Newlines cannot occur: values are single lines.
+curl_cfg() {
+    local v=${2//\\/\\\\}
+    v=${v//\"/\\\"}
+    printf '%s = "%s"\n' "$1" "$v"
+}
 
 # alert <key> <priority> <title> <body>; rate limited per key.
 alert() {
@@ -118,10 +143,13 @@ deliver_pending() {
             [[ "$event" == "$key|"* ]] || continue
             body+="${body:+$'\n'}${PENDING_DETAILS[$event]}"
         done
-        # NTFY_AUTH stays off curl's argv. Never log curl's potentially sensitive diagnostics.
-        if curl -fsS -m 15 -o /dev/null --config <(printf 'user = "%s"\n' "$NTFY_AUTH") \
+        # NTFY_AUTH and the topic URL (itself a secret on open ntfy servers) stay
+        # off curl's argv, which any local user can read. Never log curl's
+        # potentially sensitive diagnostics. Only http(s) is allowed.
+        if curl -fsS -m 15 -o /dev/null --proto =https,http \
+            --config <(curl_cfg url "$NTFY_URL"; [[ -z "$NTFY_AUTH" ]] || curl_cfg user "$NTFY_AUTH") \
             -H "Title: ${PENDING_TITLE[$key]}" -H "Priority: ${PENDING_PRIO[$key]}" \
-            -H "Tags: no-repair,thermometer" --data-binary "$body" "$NTFY_URL" 2>/dev/null; then
+            -H "Tags: no-repair,thermometer" --data-binary "$body" 2>/dev/null; then
             LAST_ALERT[$key]=$NOW
             unset 'PENDING_TITLE[$key]' 'PENDING_BODY[$key]' 'PENDING_PRIO[$key]'
             for event in "${!PENDING_DETAILS[@]}"; do
