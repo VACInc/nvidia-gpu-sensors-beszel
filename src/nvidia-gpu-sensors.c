@@ -431,35 +431,6 @@ static int bar0_temp(volatile uint8_t *bar0, unsigned off, double *out)
     return 1;
 }
 
-/* Hot Spot = max over the on-die thermal sensors. Returns 1 if any read valid. */
-static int bar0_hotspot(const GPU *g, double *out)
-{
-    if (!g->bar0)
-        return 0;
-    const unsigned *offs;
-    size_t n;
-    if (g->arch == ARCH_AMPERE_GA107) {
-        offs = NV_THERM_HOTSPOT_GA107;
-        n = sizeof NV_THERM_HOTSPOT_GA107 / sizeof NV_THERM_HOTSPOT_GA107[0];
-    } else if (g->arch == ARCH_AMPERE) {
-        offs = NV_THERM_HOTSPOT_AMPERE;
-        n = sizeof NV_THERM_HOTSPOT_AMPERE / sizeof NV_THERM_HOTSPOT_AMPERE[0];
-    } else {
-        offs = NV_THERM_HOTSPOT;
-        n = sizeof NV_THERM_HOTSPOT / sizeof NV_THERM_HOTSPOT[0];
-    }
-    double mx = -1e9;
-    for (size_t i = 0; i < n; i++) {
-        double t;
-        if (bar0_temp(g->bar0, offs[i], &t) && t > mx)
-            mx = t;
-    }
-    if (mx < -1e8)
-        return 0;
-    *out = mx;
-    return 1;
-}
-
 /* Ampere memory-junction temperature from the GDDR6/6X controller: bits 11:0
  * hold 1/32 C. Rejects readings outside a sane junction range so an unpowered
  * or renumbered register never reaches Beszel as a real sensor. */
@@ -475,8 +446,7 @@ static int bar0_vram_temp(const GPU *g, double *out)
     return 1;
 }
 
-/* Hottest on-die sensor and its register, for --detail. Same sensor set as
- * bar0_hotspot(), so the returned temperature always equals the Hot Spot. */
+/* Hottest on-die sensor and its register. Returns 1 if any sensor read valid. */
 static int bar0_hotspot_sensor(const GPU *g, double *out, unsigned *reg)
 {
     if (!g->bar0)
@@ -507,6 +477,14 @@ static int bar0_hotspot_sensor(const GPU *g, double *out, unsigned *reg)
     *out = mx;
     *reg = at;
     return 1;
+}
+
+/* Hot Spot = max over the on-die thermal sensors. One implementation with
+ * bar0_hotspot_sensor(), so --csv and --detail can never disagree. */
+static int bar0_hotspot(const GPU *g, double *out)
+{
+    unsigned reg;
+    return bar0_hotspot_sensor(g, out, &reg);
 }
 
 /*
@@ -738,7 +716,7 @@ static int gpu_setup(GPU *g, NvHandle hClient, NvU32 gpuId, unsigned index)
     }
 
     /* VOLT rail enumeration (static): learn the populated-rail mask once */
-    static uint8_t info[2444];
+    static _Alignas(8) uint8_t info[2444];
     if (rm_control(hClient, g->hSubdev, NV2080_CTRL_CMD_VOLT_VOLT_RAILS_GET_INFO, info, sizeof info,
                    NULL) == 0)
         g->railMask = ((NvU32 *)info)[1];
@@ -761,7 +739,7 @@ static void gpu_print(GPU *g)
     NvU32 v0 = 0, v1 = 0;
     int have_v0 = 0, have_v1 = 0;
     if (g->railMask) {
-        static uint8_t status[3232];
+        static _Alignas(8) uint8_t status[3232];
         ((NvU32 *)status)[1] = g->railMask;
         if (rm_control(g->hClient, g->hSubdev, NV2080_CTRL_CMD_VOLT_VOLT_RAILS_GET_STATUS,
                        status, sizeof status, NULL) == 0) {
