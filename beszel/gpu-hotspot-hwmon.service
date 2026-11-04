@@ -4,3 +4,6 @@ Description=Publish NVIDIA Blackwell hotspot temps to synthetic hwmon for Beszel
 [Service]
 Type=oneshot
 ExecStart=/opt/gpu-hotspot/update-hwmon.sh
+# Oneshot units have no start timeout by default; a hung reader would keep the
+# unit activating forever and the timer would never fire again.
+TimeoutStartSec=60

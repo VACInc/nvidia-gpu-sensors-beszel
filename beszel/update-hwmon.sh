@@ -26,16 +26,25 @@
 # the sensor; [N/A] is skipped.
 set -euo pipefail
 
-ROOT=/run/gpu-sensors-sys
+# Overrides exist for tests/update-hwmon.sh only; the unit sets none.
+ROOT="${GPU_HOTSPOT_ROOT:-/run/gpu-sensors-sys}"
 HW="$ROOT/class/hwmon"
-BIN=/opt/gpu-hotspot/bin/nvidia-gpu-sensors
+BIN="${GPU_HOTSPOT_BIN:-/opt/gpu-hotspot/bin/nvidia-gpu-sensors}"
+SYS_HWMON="${GPU_HOTSPOT_SYS_HWMON:-/sys/class/hwmon}"
+# nvidia-smi can block for minutes when a GPU falls off the bus. Bound each
+# reader so the oneshot finishes, the timer keeps firing, and sensors that
+# could not be read are removed below instead of freezing at stale values.
+READ_TIMEOUT="${GPU_HOTSPOT_READ_TIMEOUT:-20}"
 
 mkdir -p "$HW"
 
-# Mirror the real hwmon entries; indices shift across boots, so rebuild fully.
-for d in /sys/class/hwmon/hwmon*; do
+# Mirror the real hwmon entries; indices shift across boots and hotplug, so
+# rebuild fully and drop mirrors of entries that are gone (below).
+declare -A mirrored
+for d in "$SYS_HWMON"/hwmon*; do
     [ -e "$d" ] || continue
-    ln -sfn "$(readlink -f "$d")" "$HW/$(basename "$d")"
+    ln -sfn "$(readlink -f "$d")" "$HW/${d##*/}"
+    mirrored[${d##*/}]=1
 done
 
 declare -A GPU_NAME GPU_INDEX GPU_TLIMIT NAME_COUNT
@@ -44,18 +53,34 @@ while IFS=, read -r idx name bus tlimit; do
     name="${name# }"; name="${name#NVIDIA }"
     bus="${bus// /}"; bus="${bus,,}"; bdf="${bus: -12}"
     tlimit="${tlimit// /}"
+    # Indices feed arithmetic and hwmon numbering: digits only, and below 40 so
+    # hwmon900+2*idx+1 never reaches the T.Limit range at hwmon980.
+    if ! [[ "$idx" =~ ^[0-9]{1,2}$ ]] || (( 10#$idx >= 40 )); then continue; fi
+    idx=$(( 10#$idx ))
+    [[ "$bdf" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] || continue
     GPU_NAME[$bdf]="$name"
     GPU_INDEX[$bdf]="$idx"
     [[ "$tlimit" =~ ^-?[0-9]+$ ]] && GPU_TLIMIT[$bdf]="$tlimit"
     NAME_COUNT[$name]=$(( ${NAME_COUNT[$name]:-0} + 1 ))
-done < <(nvidia-smi --query-gpu=index,name,pci.bus_id,temperature.gpu.tlimit --format=csv,noheader,nounits)
+done < <(timeout "$READ_TIMEOUT" nvidia-smi --query-gpu=index,name,pci.bus_id,temperature.gpu.tlimit --format=csv,noheader,nounits)
+
+# milli <degC>: set MILLI to millidegrees. Rejects anything but a plain
+# decimal, so a malformed reading never becomes a fake 0 C sensor. Exact for
+# the tool's one-decimal output (awk %d of t*1000 turned 64.1 into 64099).
+milli() {
+    [[ "$1" =~ ^(-?)([0-9]{1,4})(\.([0-9]+))?$ ]] || return 1
+    local frac="${BASH_REMATCH[4]}000"
+    MILLI=$(( 10#${BASH_REMATCH[2]} * 1000 + 10#${frac:0:3} ))
+    [ -z "${BASH_REMATCH[1]}" ] || MILLI=$(( -MILLI ))
+}
 
 declare -A written
 write_sensor() {  # write_sensor <dirnum> <display-name> <degC>
     local dir="$HW/hwmon$1"
+    milli "$3" || return 0
     mkdir -p "$dir"
     printf '%s\n' "$2" > "$dir/name.tmp" && mv "$dir/name.tmp" "$dir/name"
-    awk -v t="$3" 'BEGIN{printf "%d\n", t*1000}' > "$dir/temp1_input.tmp"
+    printf '%d\n' "$MILLI" > "$dir/temp1_input.tmp"
     mv "$dir/temp1_input.tmp" "$dir/temp1_input"
     written[$1]=1
 }
@@ -71,12 +96,17 @@ while IFS=, read -r bdf core mem hot v0 v1; do
     [ -n "$hot" ] && write_sensor $(( 900 + 2*idx ))     "$disp Hotspot" "$hot"
     [ -n "$mem" ] && write_sensor $(( 900 + 2*idx + 1 )) "$disp VRAM"    "$mem"
     [ -n "${GPU_TLIMIT[$bdf]:-}" ] && write_sensor $(( 980 + idx )) "$disp T.Limit" "${GPU_TLIMIT[$bdf]}"
-done < <("$BIN" --csv)
+done < <(timeout "$READ_TIMEOUT" "$BIN" --csv)
 
-# Remove synthetic dirs (non-symlinks) that weren't written this run, so
-# stale sensors and old layouts never linger.
+# Remove synthetic dirs that weren't written this run and mirrors of hwmon
+# entries that no longer exist, so stale sensors and old layouts never linger
+# (a dangling mirror makes the agent log read errors every poll).
 for d in "$HW"/hwmon*; do
-    [ -L "$d" ] && continue
+    [ -e "$d" ] || [ -L "$d" ] || continue
+    if [ -L "$d" ]; then
+        [ -n "${mirrored[${d##*/}]:-}" ] || rm -f "$d"
+        continue
+    fi
     n="${d##*/hwmon}"
     [ -n "${written[$n]:-}" ] || rm -rf "$d"
 done
