@@ -3,7 +3,7 @@ Description=Log GPU hot spot / hottest VRAM chip and alert on GPU slowdowns and 
 
 [Service]
 Type=oneshot
-TimeoutStartSec=90
+TimeoutStartSec=120
 ExecStart=/opt/gpu-health/gpu-health-watch.sh
 Nice=5
 NoNewPrivileges=yes
