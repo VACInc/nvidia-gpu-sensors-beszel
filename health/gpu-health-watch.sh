@@ -47,6 +47,10 @@ RETRY_EVERY=60        # at most one delivery attempt per key per minute
 ERR_EVERY=300         # link error poll interval, seconds
 KEEP_DAYS=30
 JETSON_TRIP_MC=99000  # soctherm software throttle trip on Orin
+# Every reader is bounded: nvidia-smi can block for minutes when a GPU falls
+# off the bus. 4 readers + one 15 s send stay inside TimeoutStartSec=120, so
+# the run still logs, alerts and saves state instead of being killed.
+CMD_TIMEOUT=${GPU_HEALTH_CMD_TIMEOUT:-20}
 
 mkdir -p "$LOG_DIR" "$STATE_DIR"
 STATE="$STATE_DIR/state"
@@ -133,9 +137,12 @@ counter_alert() {
 # Persist failed one-shot counter alerts too. Retry once per key per minute,
 # even if the counter stops rising; successful sends alone start the cooldown.
 deliver_pending() {
-    local key event body
+    local key event body down=0
     for key in "${!PENDING_TITLE[@]}"; do
         (( NOW - ${LAST_ATTEMPT[$key]:-0} >= RETRY_EVERY )) || continue
+        # After one failed send the rest would most likely time out too; leave
+        # them due for the next run rather than spending 15 s on each.
+        (( down )) && continue
         LAST_ATTEMPT[$key]=$NOW
         [[ -n "$NTFY_URL" ]] || { log "alert-not-sent reason=no-ntfy-env key=$key"; continue; }
         body=${PENDING_BODY[$key]:-}
@@ -158,6 +165,7 @@ deliver_pending() {
             done
         else
             log "alert-send-failed key=$key"
+            down=1
         fi
     done
 }
@@ -208,7 +216,7 @@ nvidia_cycle() {
     if [[ -x "$HELPER" ]]; then
         while IFS= read -r line; do
             DET[${line%%,*}]=$line
-        done < <(timeout 20 "$HELPER" --detail 2>/dev/null)
+        done < <(timeout "$CMD_TIMEOUT" "$HELPER" --detail 2>/dev/null)
     fi
     while IFS=, read -r idx name bus temp tl pwr pcap swt hwt brk; do
         idx=${idx// /} name=${name# } name=${name#NVIDIA }
@@ -259,7 +267,8 @@ Since last sample: sw_thermal $(us_to_s $swhot) s, hw_thermal $(us_to_s $dh) s, 
 Core ${temp:-na} C, Hot Spot ${hot:-na} C (${hreg:-na}), hottest VRAM chip ${chip:-na} ${chipc:-na} C, T.Limit ${tl:-na}.
 Log: $LOG"
         fi
-    done < <(nvidia-smi --query-gpu=index,name,pci.bus_id,temperature.gpu,temperature.gpu.tlimit,power.draw,clocks_event_reasons_counters.sw_power_cap,clocks_event_reasons_counters.sw_thermal_slowdown,clocks_event_reasons_counters.hw_thermal_slowdown,clocks_event_reasons_counters.hw_power_brake_slowdown --format=csv,noheader,nounits 2>>"$LOG")
+    done < <(timeout "$CMD_TIMEOUT" nvidia-smi --query-gpu=index,name,pci.bus_id,temperature.gpu,temperature.gpu.tlimit,power.draw,clocks_event_reasons_counters.sw_power_cap,clocks_event_reasons_counters.sw_thermal_slowdown,clocks_event_reasons_counters.hw_thermal_slowdown,clocks_event_reasons_counters.hw_power_brake_slowdown --format=csv,noheader,nounits 2>>"$LOG")
+    wait "$!" || log "nvidia-smi-query-failed rc=$?"
 
     (( NOW - LAST_ERRPOLL >= ERR_EVERY - 5 )) || return 0
     LAST_ERRPOLL=$NOW
@@ -278,7 +287,7 @@ nvidia_errors() {
         elif [[ -n "$cur" && "$line" =~ Replay\ Number\ Rollovers[[:space:]]*:[[:space:]]*([0-9]+) ]]; then
             ROLL[$cur]=${BASH_REMATCH[1]}
         fi
-    done < <(timeout 30 nvidia-smi -q 2>/dev/null)
+    done < <(timeout "$CMD_TIMEOUT" nvidia-smi -q 2>/dev/null)
     # NVIDIA documents error labels across generations at:
     # https://docs.nvidia.com/deploy/nvidia-smi/index.html#nvlink
     # Accept integer error counters, never traffic totals or BER/throughput.
@@ -303,7 +312,7 @@ nvidia_errors() {
             NVL[$gpu.$field]=$(( ${NVL[$gpu.$field]:-0} + 10#$v ))
             NVL[$gpu.any]=1
         fi
-    done < <(timeout 30 nvidia-smi nvlink -e 2>/dev/null)
+    done < <(timeout "$CMD_TIMEOUT" nvidia-smi nvlink -e 2>/dev/null)
 
     local bdf idx name k r rr aer_c aer_n aer_f f key val
     for bdf in "${!NAME[@]}"; do
