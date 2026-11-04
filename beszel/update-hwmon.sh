@@ -29,7 +29,10 @@ set -euo pipefail
 # Overrides exist for tests/update-hwmon.sh only; the unit sets none.
 ROOT="${GPU_HOTSPOT_ROOT:-/run/gpu-sensors-sys}"
 HW="$ROOT/class/hwmon"
-BIN="${GPU_HOTSPOT_BIN:-/opt/gpu-hotspot/bin/nvidia-gpu-sensors}"
+# Keep this exact line: the Beszel release packager rewrites it with sed to
+# point at its bundled binary and refuses to build if it is missing.
+BIN=/opt/gpu-hotspot/bin/nvidia-gpu-sensors
+BIN="${GPU_HOTSPOT_BIN:-$BIN}"
 SYS_HWMON="${GPU_HOTSPOT_SYS_HWMON:-/sys/class/hwmon}"
 # nvidia-smi can block for minutes when a GPU falls off the bus. Bound each
 # reader so the oneshot finishes, the timer keeps firing, and sensors that
