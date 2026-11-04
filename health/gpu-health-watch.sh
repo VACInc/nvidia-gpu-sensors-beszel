@@ -134,8 +134,21 @@ counter_alert() {
     PENDING_BODY[$key]=$context
 }
 
+# done_pending <key>: the alert for key is finished; start its cooldown.
+done_pending() {
+    local key=$1 event
+    LAST_ALERT[$key]=$NOW
+    unset 'PENDING_TITLE[$key]' 'PENDING_BODY[$key]' 'PENDING_PRIO[$key]'
+    for event in "${!PENDING_DETAILS[@]}"; do
+        [[ "$event" == "$key|"* ]] || continue
+        unset 'PENDING_DETAILS[$event]' 'PENDING_RISE[$event]'
+    done
+}
+
 # Persist failed one-shot counter alerts too. Retry once per key per minute,
 # even if the counter stops rising; successful sends alone start the cooldown.
+# Without ntfy configured an alert is only logged, once per key per cooldown,
+# like a delivered one; it is not kept pending and re-logged every minute.
 deliver_pending() {
     local key event body down=0
     for key in "${!PENDING_TITLE[@]}"; do
@@ -144,7 +157,11 @@ deliver_pending() {
         # them due for the next run rather than spending 15 s on each.
         (( down )) && continue
         LAST_ATTEMPT[$key]=$NOW
-        [[ -n "$NTFY_URL" ]] || { log "alert-not-sent reason=no-ntfy-env key=$key"; continue; }
+        if [[ -z "$NTFY_URL" ]]; then
+            log "alert-not-sent reason=no-ntfy-env key=$key"
+            done_pending "$key"
+            continue
+        fi
         body=${PENDING_BODY[$key]:-}
         for event in "${!PENDING_DETAILS[@]}"; do
             [[ "$event" == "$key|"* ]] || continue
@@ -157,12 +174,7 @@ deliver_pending() {
             --config <(curl_cfg url "$NTFY_URL"; [[ -z "$NTFY_AUTH" ]] || curl_cfg user "$NTFY_AUTH") \
             -H "Title: ${PENDING_TITLE[$key]}" -H "Priority: ${PENDING_PRIO[$key]}" \
             -H "Tags: no-repair,thermometer" --data-binary "$body" 2>/dev/null; then
-            LAST_ALERT[$key]=$NOW
-            unset 'PENDING_TITLE[$key]' 'PENDING_BODY[$key]' 'PENDING_PRIO[$key]'
-            for event in "${!PENDING_DETAILS[@]}"; do
-                [[ "$event" == "$key|"* ]] || continue
-                unset 'PENDING_DETAILS[$event]' 'PENDING_RISE[$event]'
-            done
+            done_pending "$key"
         else
             log "alert-send-failed key=$key"
             down=1
